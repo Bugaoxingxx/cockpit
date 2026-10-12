@@ -6,6 +6,7 @@ const info = {
     entries: [
         "base1/cockpit.js",
         "apps/apps.jsx",
+        "app-health/app-health.jsx",
         "kdump/kdump.js",
         // do *not* call this metrics/metrics -- uBlock origin etc. like to block metrics.{css,js}
         "metrics/index.js",
@@ -96,6 +97,7 @@ const info = {
     // esbuild will already copy assets that are explicitly imported from JavaScript.
     // The others (top-level files, images, etc.) need to be listed explicitly
     files: [
+        "app-health/index.html",
         "apps/index.html",
         "apps/default.png",
 

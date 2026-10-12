@@ -1,0 +1,21 @@
+{
+    "requires": {
+        "cockpit": "266"
+    },
+
+    "conditions": [
+        {"path-exists": "/usr/bin/docker"}
+    ],
+
+    "menu": {
+        "index": {
+            "label": "应用健康",
+            "order": 45,
+            "keywords": [
+                {
+                    "matches": ["docker", "container", "app", "health", "monitor", "应用", "健康", "容器"]
+                }
+            ]
+        }
+    }
+}

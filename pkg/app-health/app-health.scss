@@ -1,0 +1,21 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+@use "../lib/page.scss";
+
+.app-health-status-running {
+    color: var(--pf-t--global--icon--color--status--success--default);
+}
+
+.app-health-status-exited,
+.app-health-status-dead {
+    color: var(--pf-t--global--icon--color--status--danger--default);
+}
+
+.app-health-status-created,
+.app-health-status-paused {
+    color: var(--pf-t--global--icon--color--status--warning--default);
+}
+
+.app-health-hint {
+    color: var(--pf-t--global--text--color--subtle);
+}

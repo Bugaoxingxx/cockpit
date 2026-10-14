@@ -92,6 +92,8 @@ const info = {
         "shell/machines/test-machines.js",
 
         "storaged/test-util.js",
+
+        "app-health/test-app-health-lib.js",
     ],
 
     // esbuild will already copy assets that are explicitly imported from JavaScript.

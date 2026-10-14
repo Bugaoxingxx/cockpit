@@ -1,33 +1,79 @@
-# App Health (应用健康)
+# App Health
 
-Cockpit package that lists Docker containers (by `docker run --name`) with
-status, optional CPU/memory, and restart count. Aimed at company Docker app
-health monitoring on this Cockpit fork.
+Cockpit package that lists Docker containers matching configurable name or
+label filters, with status, optional CPU/memory, and restart count. Aimed at
+company Docker app health monitoring on this Cockpit fork.
 
 ## Requirements
 
 - Cockpit (this tree, or a system install of Cockpit ≥ 266)
 - **Docker CLI** available to the logged-in Cockpit user (`docker` on `$PATH`,
-  typically `/usr/bin/docker`)
+  e.g. `/usr/bin/docker`, `/usr/local/bin/docker`, or `/snap/bin/docker`)
 - Permission to talk to the Docker daemon (user in the `docker` group, or root /
   Cockpit administrative access as appropriate for your site)
 
-The package only appears in the menu when `/usr/bin/docker` exists
-(`manifest.json` `conditions`).
+The package appears in the menu when Docker is installed at one of the paths
+checked in `manifest.json` `conditions` (same multi-path pattern as
+`pkg/sosreport`).
+
+## Container filter (company apps)
+
+The list is **not** every container on the host. Matching uses `manifest.json`
+`config` (overridable via `/etc/cockpit/app-health.override.json`):
+
+| Key | Purpose |
+| --- | --- |
+| `name-prefixes` | Array of strings; container name must start with one of them |
+| `label-selectors` | Array of `key=value` or `key` strings; container labels must match at least one |
+
+Default shipped config:
+
+```json
+"label-selectors": ["cockpit.app-health=true"]
+```
+
+Tag company apps when creating them, for example:
+
+```bash
+docker run --name payroll-api --label cockpit.app-health=true …
+```
+
+Or set name prefixes for your naming convention:
+
+```json
+{
+  "config": {
+    "name-prefixes": ["company-", "app-"],
+    "label-selectors": []
+  }
+}
+```
+
+A container is listed when it matches **any** configured name prefix **or** any
+configured label selector. If both arrays are empty, nothing is listed until
+you configure filters.
 
 ## What is implemented
 
 | Feature | Status |
 | --- | --- |
-| Menu entry **应用健康** | Done |
+| Menu entry **Application Health** (English msgid; translated in `.po`) | Done |
 | List containers via `docker ps -a --format` | Done |
+| Filter by manifest `name-prefixes` / `label-selectors` | Done |
 | Name, image, status, ports | Done |
-| Restart count via `docker inspect` | Done |
-| CPU / memory via `docker stats --no-stream` (running only) | Done |
-| Refresh button | Done |
+| Restart count via batched `docker inspect` (50 IDs per call) | Done |
+| CPU / memory via `docker stats --no-stream`, joined by container ID | Done |
+| Manual refresh + auto-refresh every 8s on the list | Done |
 | Container detail view | **Stub** (placeholder page) |
 | Start / stop / restart actions | **Not implemented** |
 | Live streaming stats | **Not implemented** |
+
+## Tests
+
+Unit tests for filter/stats helpers live in `pkg/app-health/test-app-health-lib.js`
+and run with the repo QUnit harness (`./build.js` then open `qunit/` in a
+browser, or the full Cockpit `make check` flow). There is no browser integration
+test for this package yet.
 
 ## Build (in this monorepo)
 
@@ -65,7 +111,7 @@ other `pkg/*` modules.
 The UI runs these via `cockpit.spawn` (no custom bridge):
 
 1. `docker ps -a --format '{{json .}}'` — inventory (name, status, image, ports, id)
-2. `docker inspect --format '{{json .}}' …` — restart counts (and similar metadata)
+2. `docker inspect --format '{{json .}}' …` — restart counts and labels (batched)
 3. `docker stats --no-stream --format '{{json .}}'` — one-shot CPU / memory for running containers
 
 If any command fails (Docker missing, permission denied, daemon down), the page

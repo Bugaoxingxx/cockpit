@@ -4,12 +4,21 @@
     },
 
     "conditions": [
-        {"path-exists": "/usr/bin/docker"}
+        {"any": [
+            {"path-exists": "/usr/bin/docker"},
+            {"path-exists": "/usr/local/bin/docker"},
+            {"path-exists": "/snap/bin/docker"}
+        ]}
     ],
+
+    "config": {
+        "name-prefixes": [],
+        "label-selectors": ["cockpit.app-health=true"]
+    },
 
     "menu": {
         "index": {
-            "label": "应用健康",
+            "label": "Application Health",
             "order": 45,
             "keywords": [
                 {

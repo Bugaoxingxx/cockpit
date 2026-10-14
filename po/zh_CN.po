@@ -246,6 +246,63 @@ msgstr "存储"
 msgid "Diagnostic reports"
 msgstr "诊断报告"
 
+#: pkg/app-health/index.html:8 pkg/app-health/manifest.json:0
+#: pkg/app-health/app-health.jsx:0
+msgid "Application Health"
+msgstr "应用健康"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Container: $0"
+msgstr "容器：$0"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Detail view is not implemented yet"
+msgstr "详情视图尚未实现"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "This is a stub. A future revision can show inspect JSON, logs, and lifecycle actions."
+msgstr "这是占位页面。后续版本可展示 inspect JSON、日志和生命周期操作。"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Back to list"
+msgstr "返回列表"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Loading containers..."
+msgstr "正在加载容器..."
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Failed to list Docker containers"
+msgstr "无法列出 Docker 容器"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Ensure the Docker CLI is installed and the logged-in user can run docker (e.g. membership in the docker group)."
+msgstr "请确保已安装 Docker CLI，且当前登录用户可运行 docker（例如属于 docker 组）。"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Retry"
+msgstr "重试"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Docker containers"
+msgstr "Docker 容器"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "No matching containers. Adjust filters in manifest config or tag apps with the configured label."
+msgstr "没有匹配的容器。请在 manifest 配置中调整过滤器，或为应用添加所配置的标签。"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Refresh"
+msgstr "刷新"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Docker applications"
+msgstr "Docker 应用"
+
+#: pkg/app-health/app-health.jsx:0
+msgid "Listed when container name or labels match manifest config"
+msgstr "当容器名称或标签与 manifest 配置匹配时显示"
+
 #: pkg/metrics/index.html:8 pkg/metrics/metrics.jsx:1994
 msgid "Metrics and history"
 msgstr "指标和历史数据"

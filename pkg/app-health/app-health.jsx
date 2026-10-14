@@ -7,7 +7,7 @@ import '../lib/patternfly/patternfly-6-cockpit.scss';
 import "polyfills";
 import 'cockpit-dark-theme'; // once per page
 
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from 'react-dom/client';
 import { Alert } from "@patternfly/react-core/dist/esm/components/Alert/index.js";
 import { Button } from "@patternfly/react-core/dist/esm/components/Button/index.js";
@@ -25,15 +25,23 @@ import { SyncAltIcon } from '@patternfly/react-icons';
 import cockpit from "cockpit";
 
 import {
+    activeLabelSelectors,
+    activeNamePrefixes,
+    applyInspectMetadata,
     chunkArray,
     containerMatchesFilter,
+    containersVisibleWithoutInspect,
     DEFAULT_LABEL_SELECTORS,
     INSPECT_BATCH_SIZE,
+    isContainerRunning,
+    labelSelectorToDockerFilter,
     LIST_REFRESH_MS,
     lookupStats,
-    normalizeContainerId,
+    mergeContainersById,
+    nameMatches,
     normalizeName,
     parseJsonLines,
+    STATS_BATCH_SIZE,
     statsByContainerId,
 } from './app-health-lib.js';
 
@@ -84,6 +92,27 @@ function labelColor(status, state) {
     return "grey";
 }
 
+function psRowToContainer(row) {
+    const id = row.ID || row.Id || "";
+    const name = normalizeName(
+        (row.Names || row.Name || "").split(",")[0] || id.slice(0, 12)
+    );
+    return {
+        id,
+        name,
+        image: row.Image || "",
+        status: row.Status || "",
+        state: row.State || "",
+        ports: row.Ports || "",
+        created: row.CreatedAt || row.RunningFor || "",
+        labels: {},
+        labelFilterMatched: false,
+        restartCount: null,
+        cpu: null,
+        memory: null,
+    };
+}
+
 async function dockerInspectAll(ids) {
     const inspected = [];
     for (const batch of chunkArray(ids, INSPECT_BATCH_SIZE)) {
@@ -97,92 +126,132 @@ async function dockerInspectAll(ids) {
     return inspected;
 }
 
-/**
- * Load container list + restart counts + one-shot stats.
- * Detail view is intentionally stubbed (see ContainerDetailStub).
- */
-async function loadContainers(filter) {
+async function dockerStatsForIds(ids) {
+    const rows = [];
+    for (const batch of chunkArray(ids, STATS_BATCH_SIZE)) {
+        const statsOut = await dockerSpawn([
+            "stats", "--no-stream", "--format", "{{json .}}",
+            ...batch,
+        ]);
+        rows.push(...parseJsonLines(statsOut));
+    }
+    return rows;
+}
+
+async function fetchAllPsContainers() {
     const psOut = await dockerSpawn([
         "ps", "-a",
         "--format", "{{json .}}",
     ]);
-    const listed = parseJsonLines(psOut);
+    return parseJsonLines(psOut).map(psRowToContainer);
+}
 
-    const containers = listed.map(row => {
-        const id = row.ID || row.Id || "";
-        const name = normalizeName(
-            (row.Names || row.Name || "").split(",")[0] || id.slice(0, 12)
-        );
-        return {
-            id,
-            name,
-            image: row.Image || "",
-            status: row.Status || "",
-            state: row.State || "",
-            ports: row.Ports || "",
-            created: row.CreatedAt || row.RunningFor || "",
-            labels: {},
-            restartCount: null,
-            cpu: null,
-            memory: null,
-        };
+async function fetchPsWithLabelSelector(selector) {
+    const dockerFilter = labelSelectorToDockerFilter(selector);
+    if (!dockerFilter)
+        return [];
+    const psOut = await dockerSpawn([
+        "ps", "-a",
+        "--filter", dockerFilter,
+        "--format", "{{json .}}",
+    ]);
+    return parseJsonLines(psOut).map(row => {
+        const c = psRowToContainer(row);
+        c.labelFilterMatched = true;
+        return c;
     });
+}
 
-    if (containers.length === 0)
-        return containers;
+/**
+ * Build candidate containers without inspecting the whole host: label rules use
+ * `docker ps --filter`, name rules filter the ps list in memory, union when both.
+ */
+async function gatherCandidates(filter) {
+    const namePrefixes = activeNamePrefixes(filter);
+    const labelSelectors = activeLabelSelectors(filter);
 
-    try {
-        const ids = containers.map(c => c.id).filter(Boolean);
-        if (ids.length > 0) {
-            const inspected = await dockerInspectAll(ids);
-            const byId = {};
-            for (const info of inspected) {
-                const fullId = info.Id || "";
-                const id = normalizeContainerId(fullId);
-                const name = normalizeName(info.Name || "");
-                const restartCount = info.RestartCount ?? info.State?.RestartCount ?? 0;
-                const labels = info.Config?.Labels || {};
-                const meta = { name, restartCount, fullId, state: info.State?.Status, labels };
-                byId[id] = meta;
-                if (fullId)
-                    byId[fullId] = meta;
-            }
-            for (const c of containers) {
-                const meta = byId[c.id] || byId[normalizeContainerId(c.id)];
-                if (meta) {
-                    c.restartCount = meta.restartCount;
-                    c.labels = meta.labels;
-                    if (meta.state)
-                        c.state = meta.state;
-                    if (meta.name)
-                        c.name = meta.name;
-                }
-            }
-        }
-    } catch (e) {
-        console.warn("app-health: docker inspect failed (restart counts skipped)", e);
+    if (namePrefixes.length === 0 && labelSelectors.length === 0)
+        return [];
+
+    let candidates = [];
+
+    for (const sel of labelSelectors)
+        candidates = mergeContainersById(candidates, await fetchPsWithLabelSelector(sel));
+
+    if (namePrefixes.length > 0) {
+        const all = await fetchAllPsContainers();
+        const byName = all.filter(c => nameMatches(c.name, namePrefixes));
+        candidates = mergeContainersById(candidates, byName);
     }
 
-    const filtered = containers.filter(c => containerMatchesFilter(c, filter));
+    return candidates;
+}
+
+/**
+ * Load container list + restart counts + one-shot stats for filtered apps only.
+ * Detail view is intentionally stubbed (see ContainerDetailStub).
+ */
+async function loadContainers(filter) {
+    let warning = null;
+    const candidates = await gatherCandidates(filter);
+
+    if (candidates.length === 0)
+        return { containers: [], warning: null };
+
+    const inspectIds = candidates.map(c => c.id).filter(Boolean);
+    let inspectFailed = false;
 
     try {
-        const statsOut = await dockerSpawn([
-            "stats", "--no-stream", "--format", "{{json .}}",
-        ]);
-        const byId = statsByContainerId(parseJsonLines(statsOut));
-        for (const c of filtered) {
-            const st = lookupStats(byId, c);
-            if (st) {
-                c.cpu = st.cpu;
-                c.memory = st.memory;
-            }
-        }
+        const inspected = await dockerInspectAll(inspectIds);
+        applyInspectMetadata(candidates, inspected);
     } catch (e) {
-        console.warn("app-health: docker stats failed (CPU/memory skipped)", e);
+        inspectFailed = true;
+        warning = cockpit.format(
+            _("Could not inspect containers (restart counts and labels may be incomplete): $0"),
+            e.message || String(e)
+        );
+        console.warn("app-health: docker inspect failed", e);
+    }
+
+    let filtered = candidates.filter(c => containerMatchesFilter(c, filter));
+
+    if (inspectFailed && filtered.length === 0 && candidates.length > 0) {
+        filtered = containersVisibleWithoutInspect(candidates, filter);
+        if (filtered.length > 0) {
+            warning = (warning ? warning + " " : "") +
+                _("Showing containers matched by name or label filter; inspect metadata is unavailable.");
+        } else {
+            throw new Error(
+                warning ||
+                _("Could not inspect containers and no applications matched without inspect metadata.")
+            );
+        }
+    }
+
+    const runningIds = filtered.filter(isContainerRunning).map(c => c.id).filter(Boolean);
+    if (runningIds.length > 0) {
+        try {
+            const statsRows = await dockerStatsForIds(runningIds);
+            const byId = statsByContainerId(statsRows);
+            for (const c of filtered) {
+                const st = lookupStats(byId, c);
+                if (st) {
+                    c.cpu = st.cpu;
+                    c.memory = st.memory;
+                }
+            }
+        } catch (e) {
+            const statsWarning = cockpit.format(
+                _("Could not read container stats (CPU/memory unavailable): $0"),
+                e.message || String(e)
+            );
+            warning = warning ? `${warning} ${statsWarning}` : statsWarning;
+            console.warn("app-health: docker stats failed", e);
+        }
     }
 
     filtered.sort((a, b) => a.name.localeCompare(b.name));
-    return filtered;
+    return { containers: filtered, warning };
 }
 
 const ContainerDetailStub = ({ name }) => (
@@ -208,25 +277,46 @@ const ContainerDetailStub = ({ name }) => (
 const ContainerList = () => {
     const [containers, setContainers] = useState(null);
     const [error, setError] = useState(null);
+    const [warning, setWarning] = useState(null);
     const [loading, setLoading] = useState(true);
     const filter = useMemo(() => readFilterConfig(), []);
+    const refreshGenRef = useRef(0);
+    const inFlightRef = useRef(false);
 
     const refresh = useCallback(async (options = {}) => {
         const background = options.background === true;
+        if (background && inFlightRef.current)
+            return;
+
+        const gen = ++refreshGenRef.current;
+        inFlightRef.current = true;
+
         if (!background) {
             setLoading(true);
             setError(null);
+            setWarning(null);
         }
         try {
-            const list = await loadContainers(filter);
-            setContainers(list);
-            if (!background)
-                setError(null);
+            const result = await loadContainers(filter);
+            if (gen !== refreshGenRef.current)
+                return;
+            setContainers(result.containers);
+            setError(null);
+            setWarning(result.warning);
         } catch (e) {
-            setContainers([]);
-            setError(e.message || String(e));
+            if (gen !== refreshGenRef.current)
+                return;
+            const message = e.message || String(e);
+            if (background) {
+                setWarning(message);
+            } else {
+                setContainers([]);
+                setError(message);
+            }
         } finally {
-            if (!background)
+            if (gen === refreshGenRef.current)
+                inFlightRef.current = false;
+            if (!background && gen === refreshGenRef.current)
                 setLoading(false);
         }
     }, [filter]);
@@ -290,11 +380,19 @@ const ContainerList = () => {
         );
     } else {
         body = (
-            <ListingTable aria-label={_("Docker containers")}
-                          variant="compact"
-                          emptyCaption={_("No matching containers. Adjust filters in manifest config or tag apps with the configured label.")}
-                          columns={columns}
-                          rows={rows} />
+            <>
+                {warning && (
+                    <Alert variant="warning" isInline className="app-health-warning"
+                           title={_("Some container data could not be refreshed")}>
+                        <p>{warning}</p>
+                    </Alert>
+                )}
+                <ListingTable aria-label={_("Docker containers")}
+                              variant="compact"
+                              emptyCaption={_("No matching containers. Adjust filters in manifest config or tag apps with the configured label.")}
+                              columns={columns}
+                              rows={rows} />
+            </>
         );
     }
 

@@ -246,60 +246,84 @@ msgstr "存储"
 msgid "Diagnostic reports"
 msgstr "诊断报告"
 
-#: pkg/app-health/index.html:8 pkg/app-health/manifest.json:0
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/index.html:8 pkg/app-health/manifest.json:21
+#: pkg/app-health/app-health.jsx:437
 msgid "Application Health"
 msgstr "应用健康"
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:210
+msgid "Could not inspect containers (restart counts and labels may be incomplete): $0"
+msgstr "无法 inspect 容器（重启次数与标签可能不完整）：$0"
+
+#: pkg/app-health/app-health.jsx:222
+msgid "Showing containers matched by name or label filter; inspect metadata is unavailable."
+msgstr "显示已通过名称或标签过滤器匹配的容器；inspect 元数据不可用。"
+
+#: pkg/app-health/app-health.jsx:226
+msgid "Could not inspect containers and no applications matched without inspect metadata."
+msgstr "无法 inspect 容器，且没有应用在缺少 inspect 元数据时仍匹配过滤器。"
+
+#: pkg/app-health/app-health.jsx:245
+msgid "Could not read container stats (CPU/memory unavailable): $0"
+msgstr "无法读取容器 stats（CPU/内存不可用）：$0"
+
+#: pkg/app-health/app-health.jsx:261
 msgid "Container: $0"
 msgstr "容器：$0"
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:264
 msgid "Detail view is not implemented yet"
 msgstr "详情视图尚未实现"
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:266
 msgid "This is a stub. A future revision can show inspect JSON, logs, and lifecycle actions."
 msgstr "这是占位页面。后续版本可展示 inspect JSON、日志和生命周期操作。"
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:269
 msgid "Back to list"
 msgstr "返回列表"
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:333
+msgid "Image"
+msgstr "镜像"
+
+#: pkg/app-health/app-health.jsx:337
+msgid "Restarts"
+msgstr "重启次数"
+
+#: pkg/app-health/app-health.jsx:369
 msgid "Loading containers..."
 msgstr "正在加载容器..."
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:373
 msgid "Failed to list Docker containers"
 msgstr "无法列出 Docker 容器"
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:376
 msgid "Ensure the Docker CLI is installed and the logged-in user can run docker (e.g. membership in the docker group)."
 msgstr "请确保已安装 Docker CLI，且当前登录用户可运行 docker（例如属于 docker 组）。"
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:378
 msgid "Retry"
 msgstr "重试"
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:386
+msgid "Some container data could not be refreshed"
+msgstr "部分容器数据未能刷新"
+
+#: pkg/app-health/app-health.jsx:390
 msgid "Docker containers"
 msgstr "Docker 容器"
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:392
 msgid "No matching containers. Adjust filters in manifest config or tag apps with the configured label."
 msgstr "没有匹配的容器。请在 manifest 配置中调整过滤器，或为应用添加所配置的标签。"
 
-#: pkg/app-health/app-health.jsx:0
-msgid "Refresh"
-msgstr "刷新"
-
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:414
 msgid "Docker applications"
 msgstr "Docker 应用"
 
-#: pkg/app-health/app-health.jsx:0
+#: pkg/app-health/app-health.jsx:418
 msgid "Listed when container name or labels match manifest config"
 msgstr "当容器名称或标签与 manifest 配置匹配时显示"
 
@@ -426,6 +450,7 @@ msgstr "使用以下密钥来验证其他系统"
 #: pkg/storaged/iscsi/create-dialog.jsx:97
 #: pkg/storaged/iscsi/create-dialog.jsx:154
 #: pkg/storaged/block/format-dialog.jsx:279
+#: pkg/app-health/app-health.jsx:332
 msgid "Name"
 msgstr "名称"
 
@@ -3055,6 +3080,7 @@ msgstr "占用率"
 #: pkg/systemd/overview-cards/usageCard.jsx:124 pkg/systemd/hwinfo.jsx:102
 #: pkg/metrics/metrics.jsx:100 pkg/metrics/metrics.jsx:770
 #: pkg/metrics/metrics.jsx:1553 pkg/metrics/metrics.jsx:1934
+#: pkg/app-health/app-health.jsx:335
 msgid "CPU"
 msgstr "CPU"
 
@@ -3062,6 +3088,7 @@ msgstr "CPU"
 #: pkg/systemd/hwinfo.jsx:324 pkg/systemd/service-details.jsx:738
 #: pkg/metrics/metrics.jsx:114 pkg/metrics/metrics.jsx:830
 #: pkg/metrics/metrics.jsx:1553 pkg/metrics/metrics.jsx:1935
+#: pkg/app-health/app-health.jsx:336
 msgid "Memory"
 msgstr "内存"
 
@@ -3693,6 +3720,7 @@ msgstr "固定单元"
 
 #: pkg/systemd/service-details.jsx:727 pkg/packagekit/updates.jsx:772
 #: pkg/networkmanager/network-interface.jsx:468
+#: pkg/app-health/app-health.jsx:334
 msgid "Status"
 msgstr "状态"
 
@@ -5570,6 +5598,7 @@ msgid "Filter"
 msgstr "过滤"
 
 #: pkg/networkmanager/network-interface.jsx:1070
+#: pkg/app-health/app-health.jsx:408
 msgid "Refresh"
 msgstr "刷新"
 
@@ -5709,6 +5738,7 @@ msgstr "编辑网桥设置"
 
 #: pkg/networkmanager/bridge.jsx:86 pkg/networkmanager/team.jsx:144
 #: pkg/networkmanager/network-interface-members.jsx:197
+#: pkg/app-health/app-health.jsx:338
 msgid "Ports"
 msgstr "端口"
 

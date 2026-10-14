@@ -61,9 +61,9 @@ you configure filters.
 | List containers via `docker ps -a --format` | Done |
 | Filter by manifest `name-prefixes` / `label-selectors` | Done |
 | Name, image, status, ports | Done |
-| Restart count via batched `docker inspect` (50 IDs per call) | Done |
-| CPU / memory via `docker stats --no-stream`, joined by container ID | Done |
-| Manual refresh + auto-refresh every 8s on the list | Done |
+| Restart count via batched `docker inspect` on **candidates only** (50 IDs/call) | Done |
+| CPU / memory via batched `docker stats` on **filtered running** IDs | Done |
+| Manual refresh + auto-refresh every 8s (skips overlap, keeps list on background errors) | Done |
 | Container detail view | **Stub** (placeholder page) |
 | Start / stop / restart actions | **Not implemented** |
 | Live streaming stats | **Not implemented** |
@@ -110,9 +110,9 @@ other `pkg/*` modules.
 
 The UI runs these via `cockpit.spawn` (no custom bridge):
 
-1. `docker ps -a --format '{{json .}}'` — inventory (name, status, image, ports, id)
-2. `docker inspect --format '{{json .}}' …` — restart counts and labels (batched)
-3. `docker stats --no-stream --format '{{json .}}'` — one-shot CPU / memory for running containers
+1. `docker ps -a` (optionally with `--filter label=…`) — candidate inventory only
+2. `docker inspect --format '{{json .}}' …` — restart counts / labels for candidates (batched)
+3. `docker stats --no-stream --format '{{json .}}' <ids…>` — CPU / memory for filtered running containers (batched)
 
 If any command fails (Docker missing, permission denied, daemon down), the page
 shows an error alert with the stderr message.

@@ -16,6 +16,7 @@ import {
     defaultStatsWarning,
     dockerInspectAll,
     dockerStatsForIds,
+    extractVanishedIdsFromError,
     formatWarningTimestamp,
     gatherCandidates,
     isNoSuchContainerError,
@@ -24,6 +25,7 @@ import {
     loadContainers,
     lookupStats,
     MAX_CONCURRENT_SPAWNS,
+    MAX_VANISHED_EXTRACT_RETRIES,
     mergeContainersById,
     nameMatches,
     normalizeContainerId,
@@ -315,27 +317,136 @@ QUnit.test("gatherCandidates caps concurrency at MAX_CONCURRENT_SPAWNS and dedup
     assert.strictEqual(candidates.length, 7);
 });
 
-QUnit.test("dockerStatsForIds returns structured object, retries per ID with bounded concurrency, and ignores vanished containers", async assert => {
-    const spawn = async args => {
+QUnit.test("dockerStatsForIds returns structured object, strips vanished ID from error for 1-call batch retry, and ignores vanished containers", async assert => {
+    // 1. Single vanished container in a 50-container batch: only 2 spawn calls total
+    const batch50 = Array.from({ length: 50 }, (_, i) => `cid${String(i).padStart(9, "0")}abcdef123456`);
+    const vanishedFullId = batch50[27];
+    const vanishedShortId = normalizeContainerId(vanishedFullId);
+    let statsCalls = 0;
+
+    const spawn50 = async args => {
+        statsCalls += 1;
         const ids = args.slice(4);
-        if (ids.length > 1)
-            throw new Error("Error response from daemon: No such container: id2");
-        if (ids[0] === "id1")
-            return '{"ID":"id1","Name":"/app1","CPUPerc":"12.5%","MemUsage":"50MiB / 1GiB"}\n';
-        if (ids[0] === "id2")
-            throw new Error("Error response from daemon: No such container: id2");
-        throw new Error("unexpected id");
+        if (ids.includes(vanishedFullId)) {
+            // Quote + trailing punctuation + short ID in daemon error message
+            throw new Error(`Error response from daemon: No such container: "${vanishedShortId}".`);
+        }
+        return ids.map(id => JSON.stringify({
+            ID: normalizeContainerId(id),
+            Name: `/app-${id.slice(0, 12)}`,
+            CPUPerc: "12.5%",
+            MemUsage: "50MiB / 1GiB",
+        })).join("\n");
     };
 
-    const result = await dockerStatsForIds(["id1", "id2"], spawn);
-    assert.notOk(Array.isArray(result), "returns plain object rather than array with expando properties");
-    assert.strictEqual(result.rows.length, 1);
-    assert.strictEqual(result.rows[0].ID, "id1");
-    assert.strictEqual(result.errors.length, 0, "vanished container does not record warning error");
-    assert.ok(result.vanishedIds.has("id2"));
+    const result50 = await dockerStatsForIds(batch50, spawn50);
+    assert.notOk(Array.isArray(result50), "returns plain object rather than array with expando properties");
+    assert.strictEqual(statsCalls, 2, "50-container batch with 1 vanished container retries once as a 49-ID batch (2 calls total)");
+    assert.strictEqual(result50.rows.length, 49);
+    assert.strictEqual(result50.errors.length, 0, "vanished container does not record warning error");
+    assert.ok(result50.vanishedIds.has(vanishedFullId), "records full vanished ID");
+    assert.ok(result50.vanishedIds.has(vanishedShortId), "records normalized short vanished ID");
+
+    // Verify extractVanishedIdsFromError handles full ID, short ID, quotes, and punctuation
+    assert.deepEqual(
+        extractVanishedIdsFromError(
+            new Error(`Error: No such object: '${vanishedFullId}',`),
+            batch50
+        ),
+        [vanishedFullId]
+    );
+    assert.deepEqual(
+        extractVanishedIdsFromError(
+            new Error(`Error response from daemon: No such container: "${vanishedShortId}";`),
+            [vanishedShortId]
+        ),
+        [vanishedShortId]
+    );
 });
 
-QUnit.test("dockerStatsForIds and dockerInspectAll cap concurrency across batches and per-ID retries", async assert => {
+QUnit.test("dockerStatsForIds loops vanished-ID extraction up to MAX_VANISHED_EXTRACT_RETRIES and falls back to divide-and-conquer without ID", async assert => {
+    // 1. Multiple containers vanish sequentially (3 vanished containers = 1 initial + 3 retries = 4 calls)
+    const batch20 = Array.from({ length: 20 }, (_, i) => `seq${String(i).padStart(9, "0")}`);
+    const vanishedSeq = [batch20[3], batch20[11], batch20[18]];
+    let seqCalls = 0;
+
+    const spawnSeq = async args => {
+        seqCalls += 1;
+        const ids = args.slice(4);
+        const firstMissing = vanishedSeq.find(v => ids.includes(v));
+        if (firstMissing)
+            throw new Error(`Error response from daemon: No such container: '${firstMissing}'!`);
+        return ids.map(id => JSON.stringify({ ID: id, CPUPerc: "2.0%", MemUsage: "20MiB" })).join("\n");
+    };
+
+    const seqRes = await dockerStatsForIds(batch20, spawnSeq);
+    assert.strictEqual(seqCalls, 1 + MAX_VANISHED_EXTRACT_RETRIES, `3 sequential vanished containers resolved in ${1 + MAX_VANISHED_EXTRACT_RETRIES} batch calls`);
+    assert.strictEqual(seqRes.rows.length, 17);
+    for (const v of vanishedSeq)
+        assert.ok(seqRes.vanishedIds.has(v), `recorded sequentially vanished container ${v}`);
+
+    // 1b. When more than MAX_VANISHED_EXTRACT_RETRIES (4) vanish sequentially, transitions to divide-and-conquer after cap
+    const vanished4 = [batch20[1], batch20[5], batch20[9], batch20[15]];
+    const res4 = await dockerStatsForIds(batch20, async args => {
+        const ids = args.slice(4);
+        const firstMissing = vanished4.find(v => ids.includes(v));
+        if (firstMissing)
+            throw new Error(`Error response from daemon: No such container: "${firstMissing}".`);
+        return ids.map(id => JSON.stringify({ ID: id, CPUPerc: "2.0%", MemUsage: "20MiB" })).join("\n");
+    });
+    assert.strictEqual(res4.rows.length, 16, "4 sequential vanished containers all isolated via 3 loop retries + divide-and-conquer");
+    for (const v of vanished4)
+        assert.ok(res4.vanishedIds.has(v), `recorded vanished container ${v} after exceeding loop cap`);
+
+    // 2. Error without recognizable container ID falls back to binary divide-and-conquer (O(log N) calls)
+    const batch50 = Array.from({ length: 50 }, (_, i) => `div${String(i).padStart(9, "0")}`);
+    const secretVanished = batch50[33];
+    let divideCalls = 0;
+
+    const spawnNoIdError = async args => {
+        divideCalls += 1;
+        const ids = args.slice(4);
+        if (ids.includes(secretVanished))
+            throw new Error("Error response from daemon: No such container");
+        return ids.map(id => JSON.stringify({ ID: id, CPUPerc: "3.0%", MemUsage: "30MiB" })).join("\n");
+    };
+
+    const divRes = await dockerStatsForIds(batch50, spawnNoIdError);
+    assert.strictEqual(divRes.rows.length, 49);
+    assert.ok(divRes.vanishedIds.has(secretVanished), "binary divide-and-conquer isolates vanished container even when error omits ID");
+    assert.ok(divideCalls <= 15, `divide-and-conquer used ${divideCalls} calls (<< 50 per-ID calls)`);
+
+    // 3. AbortSignal interrupts retry / divide-and-conquer immediately and frees globalSpawnLimiter
+    const abortController = new AbortController();
+    let abortedProcs = 0;
+    let activeAbortProcs = 0;
+    const spawnAbortDuringRetry = args => {
+        const ids = args.slice(4);
+        if (ids.length === 50)
+            return Promise.reject(new Error("Error response from daemon: No such container"));
+        activeAbortProcs += 1;
+        const p = new Promise(() => {});
+        p.close = reason => {
+            if (reason === "terminated") {
+                abortedProcs += 1;
+                activeAbortProcs -= 1;
+            }
+        };
+        return p;
+    };
+
+    const pendingAbort = dockerStatsForIds(batch50, spawnAbortDuringRetry, { signal: abortController.signal });
+    setTimeout(() => abortController.abort(), 15);
+    await assert.rejects(
+        pendingAbort,
+        err => err.code === "ABORT_ERR",
+        "AbortSignal aborts divide-and-conquer retry immediately"
+    );
+    assert.ok(abortedProcs > 0, "in-flight retry sub-batch processes were terminated on abort");
+    assert.strictEqual(activeAbortProcs, 0, "no leaked processes remain after aborting retry");
+});
+
+QUnit.test("dockerStatsForIds and dockerInspectAll cap concurrency across batches and divide-and-conquer retries", async assert => {
     // 500 containers = 10 batches of 50
     const ids = Array.from({ length: 500 }, (_, i) => `cid${String(i).padStart(9, "0")}`);
     let inFlight = 0;
@@ -354,8 +465,9 @@ QUnit.test("dockerStatsForIds and dockerInspectAll cap concurrency across batche
     assert.strictEqual(statsRes.rows.length, 500);
     assert.strictEqual(maxInFlight, MAX_CONCURRENT_SPAWNS, `10 batches capped at MAX_CONCURRENT_SPAWNS (${MAX_CONCURRENT_SPAWNS})`);
 
-    // Now test per-ID retry concurrency when multiple batches (120 IDs = 3 batches) fail simultaneously
+    // Now test divide-and-conquer retry concurrency when multiple batches (120 IDs = 3 batches) fail simultaneously without ID in error
     const retryIds = Array.from({ length: 120 }, (_, i) => `rid${String(i).padStart(9, "0")}`);
+    const vanishedSet = new Set(["rid000000049", "rid000000099", "rid000000119"]);
     let retryInFlight = 0;
     let maxRetryInFlight = 0;
     const spawnRetry = async args => {
@@ -364,11 +476,15 @@ QUnit.test("dockerStatsForIds and dockerInspectAll cap concurrency across batche
         maxRetryInFlight = Math.max(maxRetryInFlight, retryInFlight);
         await new Promise(resolve => setTimeout(resolve, 2));
         retryInFlight -= 1;
-        if (batch.length > 1)
-            throw new Error(`Error: No such object: ${batch[batch.length - 1]}`);
-        if (batch[0] === "rid000000049" || batch[0] === "rid000000099" || batch[0] === "rid000000119")
-            throw new Error(`Error: No such object: ${batch[0]}`);
-        return JSON.stringify({ Id: batch[0], Name: `/${batch[0]}`, RestartCount: 0, Config: { Labels: {} }, State: { Status: "running" } });
+        if (batch.some(id => vanishedSet.has(id)))
+            throw new Error("Error: No such object");
+        return batch.map(id => JSON.stringify({
+            Id: id,
+            Name: `/${id}`,
+            RestartCount: 0,
+            Config: { Labels: {} },
+            State: { Status: "running" },
+        })).join("\n");
     };
 
     const inspectRes = await dockerInspectAll(retryIds, spawnRetry);
@@ -376,7 +492,7 @@ QUnit.test("dockerStatsForIds and dockerInspectAll cap concurrency across batche
     assert.ok(inspectRes.vanishedIds.has("rid000000049"));
     assert.ok(inspectRes.vanishedIds.has("rid000000099"));
     assert.ok(inspectRes.vanishedIds.has("rid000000119"));
-    assert.strictEqual(maxRetryInFlight, MAX_CONCURRENT_SPAWNS, `multi-batch per-ID retry concurrency capped at MAX_CONCURRENT_SPAWNS (${MAX_CONCURRENT_SPAWNS})`);
+    assert.strictEqual(maxRetryInFlight, MAX_CONCURRENT_SPAWNS, `multi-batch divide-and-conquer retry concurrency capped at MAX_CONCURRENT_SPAWNS (${MAX_CONCURRENT_SPAWNS})`);
 });
 
 QUnit.test("dockerInspectAll and dockerStatsForIds do not retry per ID on non-No-such batch errors and skip remaining queued batches", async assert => {
@@ -857,5 +973,87 @@ QUnit.test("default warnings and timeout messages use cockpit.gettext when avail
         globalThis.cockpit = prevCockpit;
     }
 });
+
+QUnit.test("loadContainers excludes containers vanishing during stats and enforces statsTimeoutMs budget without failing the round", async assert => {
+    const filter = { namePrefixes: [], labelSelectors: ["cockpit.app-health=true"] };
+
+    // 1. Container vanishes after inspect but during stats -> excluded from final containers list
+    let statsCalls = 0;
+    const spawnVanishInStats = async args => {
+        if (args[0] === "ps") {
+            return [
+                JSON.stringify({ ID: "aaa111222333", Names: "web-1", Status: "Up 2 hours" }),
+                JSON.stringify({ ID: " gone44455566".trim(), Names: "web-rolling", Status: "Up 1 minute" }),
+            ].join("\n");
+        }
+        if (args[0] === "inspect") {
+            return [
+                JSON.stringify({ Id: "aaa111222333", Name: "/web-1", RestartCount: 0, Config: { Labels: { "cockpit.app-health": "true" } }, State: { Status: "running" } }),
+                JSON.stringify({ Id: "gone44455566", Name: "/web-rolling", RestartCount: 0, Config: { Labels: { "cockpit.app-health": "true" } }, State: { Status: "running" } }),
+            ].join("\n");
+        }
+        if (args[0] === "stats") {
+            statsCalls += 1;
+            const ids = args.slice(4);
+            if (ids.includes("gone44455566"))
+                throw new Error("Error response from daemon: No such container: gone44455566");
+            return JSON.stringify({ ID: "aaa111222333", Name: "/web-1", CPUPerc: "3.5%", MemUsage: "24MiB / 1GiB" });
+        }
+        throw new Error("unexpected command");
+    };
+
+    const resVanish = await loadContainers(filter, spawnVanishInStats);
+    assert.strictEqual(statsCalls, 2, "retried remaining batch once after stripping gone44455566");
+    assert.strictEqual(resVanish.warning, null, "no warning flashed when container vanishes during stats");
+    assert.deepEqual(resVanish.containers.map(c => c.name), ["web-1"], "container vanishing during stats is excluded from final list");
+    assert.strictEqual(resVanish.containers[0].cpu, "3.5%");
+
+    // 2. Stats stage exceeds statsTimeoutMs -> terminates stats process, keeps container list, records warning (does not fail manual refresh)
+    let terminatedStatsProcs = 0;
+    const spawnSlowStats = args => {
+        if (args[0] === "ps") {
+            return Promise.resolve([
+                JSON.stringify({ ID: "aaa111222333", Names: "web-1", Status: "Up 2 hours" }),
+                JSON.stringify({ ID: "bbb444555666", Names: "web-2", Status: "Up 2 hours" }),
+            ].join("\n"));
+        }
+        if (args[0] === "inspect") {
+            return Promise.resolve([
+                JSON.stringify({ Id: "aaa111222333", Name: "/web-1", RestartCount: 1, Config: { Labels: { "cockpit.app-health": "true" } }, State: { Status: "running" } }),
+                JSON.stringify({ Id: "bbb444555666", Name: "/web-2", RestartCount: 4, Config: { Labels: { "cockpit.app-health": "true" } }, State: { Status: "running" } }),
+            ].join("\n"));
+        }
+        if (args[0] === "stats") {
+            const p = new Promise(() => {});
+            p.close = reason => {
+                if (reason === "terminated")
+                    terminatedStatsProcs += 1;
+            };
+            return p;
+        }
+        return Promise.reject(new Error("unexpected"));
+    };
+
+    const controller = createRefreshController({
+        load: ({ signal }) => withCapturedWarnings(() => loadContainers(filter, {
+            spawn: spawnSlowStats,
+            signal,
+            timeoutMs: 5000,
+            statsTimeoutMs: 25,
+        })).result,
+        timeoutMs: 1000,
+    });
+
+    await controller.refresh({ background: false });
+    const state = controller.getState();
+    assert.strictEqual(state.error, null, "manual refresh does NOT enter error page when stats stage budget expires");
+    assert.strictEqual(state.consecutiveFailures, 0, "stats stage timeout degrades to partial warning without incrementing consecutiveFailures");
+    assert.strictEqual(state.containers.length, 2, "preserves inspected container list when stats stage times out");
+    assert.strictEqual(state.containers[0].restartCount, 1);
+    assert.strictEqual(state.containers[1].restartCount, 4);
+    assert.ok(state.warning.includes("docker stats timed out after 25ms"), `warning reports stats stage timeout: ${state.warning}`);
+    assert.strictEqual(terminatedStatsProcs, 1, "in-flight docker stats process was terminated when statsTimeoutMs elapsed");
+});
+
 
 

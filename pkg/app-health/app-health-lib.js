@@ -7,12 +7,16 @@ export const DEFAULT_LABEL_SELECTORS = ["cockpit.app-health=true"];
 export const INSPECT_BATCH_SIZE = 50;
 export const STATS_BATCH_SIZE = 50;
 export const MAX_CONCURRENT_SPAWNS = 4;
+export const MAX_VANISHED_EXTRACT_RETRIES = 3;
 export const DEFAULT_SPAWN_TIMEOUT_MS = 15000;
+export const DEFAULT_STATS_TIMEOUT_MS = 20000;
 export const DEFAULT_REFRESH_TIMEOUT_MS = 30000;
 export const LIST_REFRESH_MS = 8000;
 
 const LIMITED_SPAWN_SYMBOL = Symbol.for("cockpit.app-health.limitedSpawn");
 const SPAWN_SIGNAL_SYMBOL = Symbol.for("cockpit.app-health.spawnSignal");
+const RAW_SPAWN_SYMBOL = Symbol.for("cockpit.app-health.rawSpawn");
+const SPAWN_LIMITER_SYMBOL = Symbol.for("cockpit.app-health.spawnLimiter");
 
 function _(msgid) {
     const gettext = globalThis.cockpit?.gettext;
@@ -169,7 +173,18 @@ function toLimitedSpawn(spawn, options = {}) {
     if (spawn && spawn[LIMITED_SPAWN_SYMBOL]) {
         if (!signal || spawn[SPAWN_SIGNAL_SYMBOL] === signal)
             return spawn;
-        return withSpawnTimeout(spawn, 0, { signal });
+        const baseSpawn = spawn[RAW_SPAWN_SYMBOL] || spawn;
+        const existingLimiter = spawn[SPAWN_LIMITER_SYMBOL] || resolveSpawnLimiter(options);
+        const rewrappedAbortable = withSpawnTimeout(baseSpawn, 0, { signal });
+        const rewrapped = (args, spawnOpts) => existingLimiter(() => {
+            throwIfAborted(signal);
+            return rewrappedAbortable(args, spawnOpts);
+        }, signal);
+        rewrapped[LIMITED_SPAWN_SYMBOL] = true;
+        rewrapped[RAW_SPAWN_SYMBOL] = baseSpawn;
+        rewrapped[SPAWN_LIMITER_SYMBOL] = existingLimiter;
+        rewrapped[SPAWN_SIGNAL_SYMBOL] = signal;
+        return rewrapped;
     }
     const limiter = resolveSpawnLimiter(options);
     const abortableSpawn = signal && spawn?.[SPAWN_SIGNAL_SYMBOL] !== signal
@@ -180,6 +195,8 @@ function toLimitedSpawn(spawn, options = {}) {
         return abortableSpawn(args, spawnOpts);
     }, signal);
     wrapped[LIMITED_SPAWN_SYMBOL] = true;
+    wrapped[RAW_SPAWN_SYMBOL] = spawn;
+    wrapped[SPAWN_LIMITER_SYMBOL] = limiter;
     if (signal)
         wrapped[SPAWN_SIGNAL_SYMBOL] = signal;
     return wrapped;
@@ -231,99 +248,104 @@ export function withSpawnTimeout(spawn, timeoutMs = DEFAULT_SPAWN_TIMEOUT_MS, op
     if (!hasTimeout && (!signal || spawn?.[SPAWN_SIGNAL_SYMBOL] === signal))
         return spawn;
 
-    const wrapped = (args, spawnOptions) => new Promise((resolve, reject) => {
-        if (signal?.aborted) {
-            try {
-                throwIfAborted(signal);
-            } catch (err) {
-                reject(err);
-            }
-            return;
-        }
-
-        let settled = false;
-        let proc;
-        let timer = null;
-        let cleanupAbort = null;
-
-        const terminateProc = () => {
-            try {
-                proc?.close?.("terminated");
-            } catch (e) {
-                // ignore close errors on timed-out or aborted process
-            }
-        };
-
-        const cleanup = () => {
-            if (timer !== null) {
-                clearTimeout(timer);
-                timer = null;
-            }
-            if (cleanupAbort) {
-                cleanupAbort();
-                cleanupAbort = null;
-            }
-        };
-
-        if (signal && typeof signal.addEventListener === "function") {
-            const onAbort = () => {
-                if (settled)
-                    return;
-                settled = true;
-                cleanup();
-                terminateProc();
+    const wrapped = (args, spawnOptions) => {
+        let terminateProc = () => {};
+        const p = new Promise((resolve, reject) => {
+            if (signal?.aborted) {
                 try {
                     throwIfAborted(signal);
                 } catch (err) {
                     reject(err);
                 }
-            };
-            signal.addEventListener("abort", onAbort, { once: true });
-            cleanupAbort = () => signal.removeEventListener("abort", onAbort);
-        }
-
-        if (hasTimeout) {
-            timer = setTimeout(() => {
-                if (settled)
-                    return;
-                settled = true;
-                cleanup();
-                terminateProc();
-                const subcmd = Array.isArray(args) && args[0] ? `docker ${args[0]}` : "docker command";
-                const err = new Error(formatTimeoutError(subcmd, timeoutMs));
-                err.code = "SPAWN_TIMEOUT";
-                err.command = subcmd;
-                err.timeoutMs = timeoutMs;
-                reject(err);
-            }, timeoutMs);
-        }
-
-        try {
-            proc = spawn(args, spawnOptions);
-        } catch (err) {
-            settled = true;
-            cleanup();
-            reject(err);
-            return;
-        }
-
-        Promise.resolve(proc).then(
-            val => {
-                if (settled)
-                    return;
-                settled = true;
-                cleanup();
-                resolve(val);
-            },
-            err => {
-                if (settled)
-                    return;
-                settled = true;
-                cleanup();
-                reject(err);
+                return;
             }
-        );
-    });
+
+            let settled = false;
+            let proc;
+            let timer = null;
+            let cleanupAbort = null;
+
+            terminateProc = (reason = "terminated") => {
+                try {
+                    proc?.close?.(reason);
+                } catch (e) {
+                    // ignore close errors on timed-out or aborted process
+                }
+            };
+
+            const cleanup = () => {
+                if (timer !== null) {
+                    clearTimeout(timer);
+                    timer = null;
+                }
+                if (cleanupAbort) {
+                    cleanupAbort();
+                    cleanupAbort = null;
+                }
+            };
+
+            if (signal && typeof signal.addEventListener === "function") {
+                const onAbort = () => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    cleanup();
+                    terminateProc("terminated");
+                    try {
+                        throwIfAborted(signal);
+                    } catch (err) {
+                        reject(err);
+                    }
+                };
+                signal.addEventListener("abort", onAbort, { once: true });
+                cleanupAbort = () => signal.removeEventListener("abort", onAbort);
+            }
+
+            if (hasTimeout) {
+                timer = setTimeout(() => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    cleanup();
+                    terminateProc("terminated");
+                    const subcmd = Array.isArray(args) && args[0] ? `docker ${args[0]}` : "docker command";
+                    const err = new Error(formatTimeoutError(subcmd, timeoutMs));
+                    err.code = "SPAWN_TIMEOUT";
+                    err.command = subcmd;
+                    err.timeoutMs = timeoutMs;
+                    reject(err);
+                }, timeoutMs);
+            }
+
+            try {
+                proc = spawn(args, spawnOptions);
+            } catch (err) {
+                settled = true;
+                cleanup();
+                reject(err);
+                return;
+            }
+
+            Promise.resolve(proc).then(
+                val => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    cleanup();
+                    resolve(val);
+                },
+                err => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    cleanup();
+                    reject(err);
+                }
+            );
+        });
+        p.close = reason => terminateProc(reason);
+        return p;
+    };
     if (spawn?.[LIMITED_SPAWN_SYMBOL])
         wrapped[LIMITED_SPAWN_SYMBOL] = true;
     if (signal)
@@ -682,16 +704,167 @@ export function isNoSuchContainerError(err) {
     return /no such (?:container|object)/i.test(msg);
 }
 
+function cleanExtractedContainerToken(raw) {
+    if (typeof raw !== "string")
+        return "";
+    return raw.trim().replace(/^['"`(\[<]+|['"`.,;:!?)\]>]+$/g, "").trim();
+}
+
+/**
+ * Extract container IDs mentioned in a Docker "No such container/object" error message
+ * and match them against `batchIds` (supporting both full IDs and 12-char short IDs,
+ * after stripping surrounding quotes or trailing punctuation).
+ */
+export function extractVanishedIdsFromError(err, batchIds) {
+    const msg = err?.message || String(err || "");
+    if (!msg || !Array.isArray(batchIds) || batchIds.length === 0)
+        return [];
+
+    const regex = /no such (?:container|object):?\s*([^\s\r\n]+)/gi;
+    const tokens = [];
+    let match;
+    while ((match = regex.exec(msg)) !== null) {
+        const cleaned = cleanExtractedContainerToken(match[1]);
+        if (cleaned)
+            tokens.push(cleaned.toLowerCase());
+    }
+    if (tokens.length === 0)
+        return [];
+
+    const matched = [];
+    for (const id of batchIds) {
+        if (!id)
+            continue;
+        const idLower = String(id).toLowerCase();
+        const shortId = normalizeContainerId(idLower);
+        const isMatch = tokens.some(tok => {
+            if (tok === idLower || tok === shortId)
+                return true;
+            const shortTok = normalizeContainerId(tok);
+            if (shortTok && shortId && shortTok === shortId && (tok.length >= 12 || idLower.length >= 12))
+                return true;
+            if (tok.length >= 12 && (idLower.startsWith(tok) || tok.startsWith(idLower)))
+                return true;
+            return false;
+        });
+        if (isMatch)
+            matched.push(id);
+    }
+    return matched;
+}
+
+/**
+ * Execute a batched Docker command (`inspect` or `stats`) with fast recovery when a container
+ * vanishes mid-refresh:
+ * 1. Try the whole batch at once.
+ * 2. On "No such container/object", parse the vanished container ID(s) from the error text,
+ *    remove them from the batch, and retry the remaining batch as a single call (looping up to
+ *    `maxExtractRetries` times when multiple containers vanish one after another).
+ * 3. If the error text does not identify a container in the batch (or more than `maxExtractRetries`
+ *    containers vanish sequentially), fall back to binary divide-and-conquer (`O(log N)` calls)
+ *    through the shared `limitedSpawn` and `AbortSignal`.
+ * 4. Non-"No such container/object" errors (daemon errors, permissions, timeouts) fail the batch
+ *    immediately without retrying.
+ */
+async function runBatchWithVanishedFallback(batch, buildArgs, limitedSpawn, {
+    signal,
+    shouldStop = () => false,
+    onFastFail = () => {},
+    maxExtractRetries = MAX_VANISHED_EXTRACT_RETRIES,
+} = {}) {
+    let remaining = [...batch];
+    const vanishedIds = [];
+    let extractRetries = 0;
+
+    while (remaining.length > 0) {
+        throwIfAborted(signal);
+        if (shouldStop())
+            return { rows: [], errors: [], vanishedIds };
+        try {
+            const out = await limitedSpawn(buildArgs(remaining));
+            return { rows: parseJsonLines(out), errors: [], vanishedIds };
+        } catch (err) {
+            if (signal?.aborted || isAbortError(err))
+                throw err;
+            if (!isNoSuchContainerError(err)) {
+                onFastFail();
+                return { rows: [], errors: [err], vanishedIds };
+            }
+            if (remaining.length <= 1) {
+                vanishedIds.push(...remaining);
+                return { rows: [], errors: [], vanishedIds };
+            }
+            if (extractRetries < maxExtractRetries) {
+                const extracted = extractVanishedIdsFromError(err, remaining);
+                if (extracted.length > 0) {
+                    const extractedSet = new Set(extracted);
+                    vanishedIds.push(...extracted);
+                    remaining = remaining.filter(id => !extractedSet.has(id));
+                    extractRetries += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+
+    if (remaining.length === 0)
+        return { rows: [], errors: [], vanishedIds };
+
+    const evalSubBatch = async subBatch => {
+        throwIfAborted(signal);
+        if (subBatch.length === 0 || shouldStop())
+            return { rows: [], errors: [], vanishedIds: [] };
+        try {
+            const out = await limitedSpawn(buildArgs(subBatch));
+            return { rows: parseJsonLines(out), errors: [], vanishedIds: [] };
+        } catch (subErr) {
+            if (signal?.aborted || isAbortError(subErr))
+                throw subErr;
+            if (!isNoSuchContainerError(subErr))
+                return { rows: [], errors: [subErr], vanishedIds: [] };
+            if (subBatch.length <= 1)
+                return { rows: [], errors: [], vanishedIds: [...subBatch] };
+            return splitSubBatch(subBatch);
+        }
+    };
+
+    const splitSubBatch = async subBatch => {
+        throwIfAborted(signal);
+        const mid = Math.ceil(subBatch.length / 2);
+        const left = subBatch.slice(0, mid);
+        const right = subBatch.slice(mid);
+        const [leftRes, rightRes] = await Promise.all([
+            evalSubBatch(left),
+            evalSubBatch(right),
+        ]);
+        return {
+            rows: [...leftRes.rows, ...rightRes.rows],
+            errors: [...leftRes.errors, ...rightRes.errors],
+            vanishedIds: [...leftRes.vanishedIds, ...rightRes.vanishedIds],
+        };
+    };
+
+    const splitRes = await splitSubBatch(remaining);
+    return {
+        rows: splitRes.rows,
+        errors: splitRes.errors,
+        vanishedIds: [...vanishedIds, ...splitRes.vanishedIds],
+    };
+}
+
 /**
  * Inspect candidate container IDs in batches of `INSPECT_BATCH_SIZE` with bounded concurrency.
  * Only when a multi-ID batch fails with a "No such container/object" error (a container vanished
- * mid-refresh) does it retry each ID in that batch individually; timeouts or daemon errors fail
- * the batch immediately without amplifying requests.
+ * mid-refresh) does it strip the vanished ID(s) and retry the batch (or binary-split if the error
+ * does not name the container); timeouts or daemon errors fail the batch immediately without
+ * amplifying requests.
  * Returns `{ rows, errors, vanishedIds }`.
  */
 export async function dockerInspectAll(ids, spawn, options = {}) {
     const concurrency = options.concurrency || MAX_CONCURRENT_SPAWNS;
     const signal = options.signal;
+    const maxExtractRetries = options.maxExtractRetries ?? MAX_VANISHED_EXTRACT_RETRIES;
     throwIfAborted(signal);
     const limitedSpawn = toLimitedSpawn(spawn, { concurrency, limiter: options.limiter, signal });
 
@@ -699,49 +872,19 @@ export async function dockerInspectAll(ids, spawn, options = {}) {
     const batches = chunkArray(cleanIds, INSPECT_BATCH_SIZE);
     let batchFailedFast = false;
     const batchResults = await mapWithConcurrency(batches, concurrency, async batch => {
-        throwIfAborted(signal);
-        if (batchFailedFast)
-            return { rows: [], errors: [], vanishedIds: [] };
-        try {
-            const inspectOut = await limitedSpawn([
-                "inspect",
-                "--format", "{{json .}}",
-                ...batch,
-            ]);
-            return { rows: parseJsonLines(inspectOut), errors: [], vanishedIds: [] };
-        } catch (err) {
-            if (signal?.aborted || isAbortError(err))
-                throw err;
-            if (!isNoSuchContainerError(err)) {
-                batchFailedFast = true;
-                return { rows: [], errors: [err], vanishedIds: [] };
+        const res = await runBatchWithVanishedFallback(
+            batch,
+            targetIds => ["inspect", "--format", "{{json .}}", ...targetIds],
+            limitedSpawn,
+            {
+                signal,
+                shouldStop: () => batchFailedFast,
+                onFastFail: () => { batchFailedFast = true },
+                maxExtractRetries,
             }
-            if (batch.length <= 1)
-                return { rows: [], errors: [], vanishedIds: [...batch] };
-
-            const rows = [];
-            const errors = [];
-            const vanishedIds = [];
-            await mapWithConcurrency(batch, concurrency, async id => {
-                throwIfAborted(signal);
-                try {
-                    const out = await limitedSpawn([
-                        "inspect",
-                        "--format", "{{json .}}",
-                        id,
-                    ]);
-                    rows.push(...parseJsonLines(out));
-                } catch (retryErr) {
-                    if (signal?.aborted || isAbortError(retryErr))
-                        throw retryErr;
-                    if (isNoSuchContainerError(retryErr))
-                        vanishedIds.push(id);
-                    else
-                        errors.push(retryErr);
-                }
-            }, { signal });
-            return { rows, errors, vanishedIds };
-        }
+        );
+        options.onBatchResult?.(res);
+        return res;
     }, { signal });
 
     const rows = [];
@@ -763,14 +906,17 @@ export async function dockerInspectAll(ids, spawn, options = {}) {
 /**
  * Read one-shot `docker stats --no-stream` for `ids` in batches of `STATS_BATCH_SIZE`
  * with bounded concurrency.
- * Only when a multi-ID batch fails with a "No such container/object" error (one container was
- * removed during a rolling update) does it retry each ID in that batch individually; timeouts or
- * daemon errors fail the batch immediately without amplifying requests.
+ * When a multi-ID batch fails with a "No such container/object" error (a container was removed
+ * during a rolling update), strips the vanished ID(s) from the error and retries the remaining
+ * batch (up to `MAX_VANISHED_EXTRACT_RETRIES` times), falling back to binary divide-and-conquer
+ * if the error does not name the container; timeouts or daemon errors fail the batch immediately
+ * without amplifying requests.
  * Returns `{ rows, errors, vanishedIds }`.
  */
 export async function dockerStatsForIds(ids, spawn, options = {}) {
     const concurrency = options.concurrency || MAX_CONCURRENT_SPAWNS;
     const signal = options.signal;
+    const maxExtractRetries = options.maxExtractRetries ?? MAX_VANISHED_EXTRACT_RETRIES;
     throwIfAborted(signal);
     const limitedSpawn = toLimitedSpawn(spawn, { concurrency, limiter: options.limiter, signal });
 
@@ -778,47 +924,19 @@ export async function dockerStatsForIds(ids, spawn, options = {}) {
     const batches = chunkArray(cleanIds, STATS_BATCH_SIZE);
     let batchFailedFast = false;
     const batchResults = await mapWithConcurrency(batches, concurrency, async batch => {
-        throwIfAborted(signal);
-        if (batchFailedFast)
-            return { rows: [], errors: [], vanishedIds: [] };
-        try {
-            const statsOut = await limitedSpawn([
-                "stats", "--no-stream", "--format", "{{json .}}",
-                ...batch,
-            ]);
-            return { rows: parseJsonLines(statsOut), errors: [], vanishedIds: [] };
-        } catch (err) {
-            if (signal?.aborted || isAbortError(err))
-                throw err;
-            if (!isNoSuchContainerError(err)) {
-                batchFailedFast = true;
-                return { rows: [], errors: [err], vanishedIds: [] };
+        const res = await runBatchWithVanishedFallback(
+            batch,
+            targetIds => ["stats", "--no-stream", "--format", "{{json .}}", ...targetIds],
+            limitedSpawn,
+            {
+                signal,
+                shouldStop: () => batchFailedFast,
+                onFastFail: () => { batchFailedFast = true },
+                maxExtractRetries,
             }
-            if (batch.length <= 1)
-                return { rows: [], errors: [], vanishedIds: [...batch] };
-
-            const rows = [];
-            const errors = [];
-            const vanishedIds = [];
-            await mapWithConcurrency(batch, concurrency, async id => {
-                throwIfAborted(signal);
-                try {
-                    const singleOut = await limitedSpawn([
-                        "stats", "--no-stream", "--format", "{{json .}}",
-                        id,
-                    ]);
-                    rows.push(...parseJsonLines(singleOut));
-                } catch (retryErr) {
-                    if (signal?.aborted || isAbortError(retryErr))
-                        throw retryErr;
-                    if (isNoSuchContainerError(retryErr))
-                        vanishedIds.push(id);
-                    else
-                        errors.push(retryErr);
-                }
-            }, { signal });
-            return { rows, errors, vanishedIds };
-        }
+        );
+        options.onBatchResult?.(res);
+        return res;
     }, { signal });
 
     const rows = [];
@@ -912,13 +1030,14 @@ export function defaultStatsWarning(msg) {
 /**
  * Load container list + restart counts + one-shot stats for filtered apps only.
  * `options` may be a `spawn(args)` function or
- * `{ spawn, concurrency, limiter, timeoutMs, signal, formatSpawnTimeout, formatInspectWarning, formatStatsWarning }`.
+ * `{ spawn, concurrency, limiter, timeoutMs, statsTimeoutMs, refreshTimeoutMs, signal, formatSpawnTimeout, formatInspectWarning, formatStatsWarning }`.
  */
 export async function loadContainers(filter, options = {}) {
     const opts = typeof options === "function" ? { spawn: options } : (options || {});
     const rawSpawn = opts.spawn;
     const concurrency = opts.concurrency || MAX_CONCURRENT_SPAWNS;
     const timeoutMs = opts.timeoutMs === undefined ? DEFAULT_SPAWN_TIMEOUT_MS : opts.timeoutMs;
+    const refreshTimeoutMs = opts.refreshTimeoutMs === undefined ? DEFAULT_REFRESH_TIMEOUT_MS : opts.refreshTimeoutMs;
     const signal = opts.signal;
     const formatInspectWarning = opts.formatInspectWarning || defaultInspectWarning;
     const formatStatsWarning = opts.formatStatsWarning || defaultStatsWarning;
@@ -928,6 +1047,7 @@ export async function loadContainers(filter, options = {}) {
         throw new Error("loadContainers requires a spawn function");
 
     throwIfAborted(signal);
+    const roundStartMs = Date.now();
 
     const timedSpawn = withSpawnTimeout(rawSpawn, timeoutMs, {
         signal,
@@ -976,13 +1096,59 @@ export async function loadContainers(filter, options = {}) {
     const survivingCandidates = vanishedIds.size > 0
         ? candidates.filter(c => !vanishedIds.has(c.id) && !vanishedIds.has(normalizeContainerId(c.id)))
         : candidates;
-    const filtered = survivingCandidates.filter(c => containerMatchesFilter(c, normalizedFilter));
+    let filtered = survivingCandidates.filter(c => containerMatchesFilter(c, normalizedFilter));
 
     const runningIds = filtered.filter(isContainerRunning).map(c => c.id).filter(Boolean);
     if (runningIds.length > 0) {
-        try {
-            const statsResult = await dockerStatsForIds(runningIds, spawn, { concurrency, signal });
-            const byId = statsByContainerId(statsResult.rows);
+        const elapsedMs = Date.now() - roundStartMs;
+        const defaultStatsBudget = refreshTimeoutMs > 0
+            ? Math.min(DEFAULT_STATS_TIMEOUT_MS, Math.max(1000, refreshTimeoutMs - elapsedMs - 2000))
+            : DEFAULT_STATS_TIMEOUT_MS;
+        const effectiveStatsTimeoutMs = opts.statsTimeoutMs === undefined
+            ? defaultStatsBudget
+            : opts.statsTimeoutMs;
+
+        const statsAbortController = typeof AbortController === "function" ? new AbortController() : null;
+        const statsSignal = statsAbortController ? statsAbortController.signal : signal;
+        let statsTimedOut = false;
+        let statsTimeoutError = null;
+        let statsTimer = null;
+        let cleanupParentAbort = null;
+
+        if (statsAbortController && signal) {
+            if (signal.aborted) {
+                statsAbortController.abort(signal.reason);
+            } else if (typeof signal.addEventListener === "function") {
+                const onParentAbort = () => statsAbortController.abort(signal.reason);
+                signal.addEventListener("abort", onParentAbort, { once: true });
+                cleanupParentAbort = () => signal.removeEventListener("abort", onParentAbort);
+            }
+        }
+
+        if (statsAbortController && effectiveStatsTimeoutMs && effectiveStatsTimeoutMs > 0) {
+            statsTimer = setTimeout(() => {
+                statsTimedOut = true;
+                statsTimeoutError = new Error(formatSpawnTimeout("docker stats", effectiveStatsTimeoutMs));
+                statsTimeoutError.code = "STATS_TIMEOUT";
+                statsTimeoutError.timeoutMs = effectiveStatsTimeoutMs;
+                try {
+                    statsAbortController.abort(createAbortError(statsTimeoutError.message));
+                } catch (err) {
+                    // ignore abort errors
+                }
+            }, effectiveStatsTimeoutMs);
+        }
+
+        const partialRows = [];
+        const partialVanishedIds = new Set();
+
+        const applyStatsRowsAndVanished = (rows, vanishedSet) => {
+            if (vanishedSet?.size > 0) {
+                filtered = filtered.filter(
+                    c => !vanishedSet.has(c.id) && !vanishedSet.has(normalizeContainerId(c.id))
+                );
+            }
+            const byId = statsByContainerId(rows);
             for (const c of filtered) {
                 const st = lookupStats(byId, c);
                 if (st) {
@@ -990,16 +1156,40 @@ export async function loadContainers(filter, options = {}) {
                     c.memory = st.memory;
                 }
             }
+        };
+
+        try {
+            const statsResult = await dockerStatsForIds(runningIds, spawn, {
+                concurrency,
+                signal: statsSignal,
+                onBatchResult: res => {
+                    partialRows.push(...res.rows);
+                    for (const id of res.vanishedIds) {
+                        partialVanishedIds.add(id);
+                        partialVanishedIds.add(normalizeContainerId(id));
+                    }
+                },
+            });
+            applyStatsRowsAndVanished(statsResult.rows, statsResult.vanishedIds);
             if (statsResult.errors?.length > 0) {
                 const statsWarning = formatStatsWarning(summarizeErrors(statsResult.errors));
                 warning = warning ? `${warning} ${statsWarning}` : statsWarning;
             }
         } catch (e) {
-            if (signal?.aborted || isAbortError(e))
+            if (signal?.aborted || (isAbortError(e) && !statsTimedOut))
                 throw e;
-            const statsWarning = formatStatsWarning(e?.message || String(e));
+            applyStatsRowsAndVanished(partialRows, partialVanishedIds);
+            const msg = statsTimedOut && statsTimeoutError
+                ? statsTimeoutError.message
+                : (e?.message || String(e));
+            const statsWarning = formatStatsWarning(msg);
             warning = warning ? `${warning} ${statsWarning}` : statsWarning;
-            console.warn("app-health: docker stats failed", e);
+            console.warn("app-health: docker stats failed", statsTimedOut ? statsTimeoutError : e);
+        } finally {
+            if (statsTimer !== null)
+                clearTimeout(statsTimer);
+            if (cleanupParentAbort)
+                cleanupParentAbort();
         }
     }
 

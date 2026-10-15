@@ -64,9 +64,9 @@ non-array `label-selectors` value falls back to the default
 | List containers via `docker ps -a --format` | Done |
 | Filter by manifest `name-prefixes` / `label-selectors` (with UI notice on invalid/empty config) | Done |
 | Name, image, status, ports | Done |
-| Restart count via batched `docker inspect` on **candidates only** (50 IDs/call, shared global concurrency cap of 4, per-ID fallback only when a container disappears mid-refresh) | Done |
-| CPU / memory via batched `docker stats` on **filtered running** IDs (shared global concurrency cap of 4, per-ID retry only when a container disappears mid-refresh) | Done |
-| Manual refresh + auto-refresh every 8s (manual preemption over background, `AbortSignal` cancellation on per-command/per-round timeouts, timezone-aware timestamps + failure count on both warnings and errors) | Done |
+| Restart count via batched `docker inspect` on **candidates only** (50 IDs/call, shared global concurrency cap of 4, vanished-ID extraction batch retry + binary divide-and-conquer fallback when a container disappears mid-refresh) | Done |
+| CPU / memory via batched `docker stats` on **filtered running** IDs (shared global concurrency cap of 4, vanished-ID extraction batch retry + binary divide-and-conquer fallback, bounded by a dedicated stage timeout so slow stats degrade to a warning without failing the round) | Done |
+| Manual refresh + auto-refresh every 8s (manual preemption over background, `AbortSignal` cancellation on per-command/per-stage/per-round timeouts, timezone-aware timestamps + failure count on both warnings and errors) | Done |
 | Container detail view | **Stub** (placeholder page) |
 | Start / stop / restart actions | **Not implemented** |
 | Live streaming stats | **Not implemented** |
@@ -74,8 +74,8 @@ non-array `label-selectors` value falls back to the default
 ## Tests & i18n
 
 Unit tests for filter matching, config validation, shared global concurrency,
-per-command and per-round timeout cancellation (`AbortSignal`), fast-fail vs
-per-ID retry on vanished containers, and refresh preemption/warning metadata
+per-command/per-stage/per-round timeout cancellation (`AbortSignal`), fast-fail vs
+vanished-ID batch retry / divide-and-conquer fallback on vanished containers, and refresh preemption/warning metadata
 live in `pkg/app-health/test-app-health-lib.js` and run with the repo QUnit
 harness (`./build.js` then open `qunit/` in a browser, or the full Cockpit
 `make check` flow). There is no browser integration test for this package yet.

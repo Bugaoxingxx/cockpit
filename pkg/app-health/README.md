@@ -51,37 +51,43 @@ Or set name prefixes for your naming convention:
 
 A container is listed when it matches **any** configured name prefix **or** any
 configured label selector. If both arrays are empty, nothing is listed until
-you configure filters. Invalid filter entries or non-array values are surfaced
-as an inline warning banner in the UI (and a non-array `label-selectors` value
-falls back to the default `cockpit.app-health=true`).
+you configure filters. Invalid filter entries, non-array values, or an empty
+effective rule set are surfaced as an inline notice banner in the UI (and a
+non-array `label-selectors` value falls back to the default
+`cockpit.app-health=true`).
 
 ## What is implemented
 
 | Feature | Status |
 | --- | --- |
-| Menu entry **Application Health** (English msgid; translated in `.po`) | Done |
+| Menu entry **Application Health** + search keywords (English msgids in `manifest.json`; translated in `.po`) | Done |
 | List containers via `docker ps -a --format` | Done |
-| Filter by manifest `name-prefixes` / `label-selectors` (with UI warning on invalid config) | Done |
+| Filter by manifest `name-prefixes` / `label-selectors` (with UI notice on invalid/empty config) | Done |
 | Name, image, status, ports | Done |
-| Restart count via batched `docker inspect` on **candidates only** (50 IDs/call, concurrency capped at 4, per-ID fallback on batch failure) | Done |
-| CPU / memory via batched `docker stats` on **filtered running** IDs (concurrency capped at 4, per-ID retry when a container disappears mid-refresh) | Done |
-| Manual refresh + auto-refresh every 8s (manual preemption over background, per-command and per-refresh timeouts, dated warning timestamps + failure count) | Done |
+| Restart count via batched `docker inspect` on **candidates only** (50 IDs/call, shared global concurrency cap of 4, per-ID fallback only when a container disappears mid-refresh) | Done |
+| CPU / memory via batched `docker stats` on **filtered running** IDs (shared global concurrency cap of 4, per-ID retry only when a container disappears mid-refresh) | Done |
+| Manual refresh + auto-refresh every 8s (manual preemption over background, `AbortSignal` cancellation on per-command/per-round timeouts, timezone-aware timestamps + failure count on both warnings and errors) | Done |
 | Container detail view | **Stub** (placeholder page) |
 | Start / stop / restart actions | **Not implemented** |
 | Live streaming stats | **Not implemented** |
 
 ## Tests & i18n
 
-Unit tests for filter matching, config validation, bounded concurrency, timeouts,
-data loading (with mock `spawn`), and refresh preemption/warning metadata live in
-`pkg/app-health/test-app-health-lib.js` and run with the repo QUnit harness
-(`./build.js` then open `qunit/` in a browser, or the full Cockpit `make check`
-flow). There is no browser integration test for this package yet.
+Unit tests for filter matching, config validation, shared global concurrency,
+per-command and per-round timeout cancellation (`AbortSignal`), fast-fail vs
+per-ID retry on vanished containers, and refresh preemption/warning metadata
+live in `pkg/app-health/test-app-health-lib.js` and run with the repo QUnit
+harness (`./build.js` then open `qunit/` in a browser, or the full Cockpit
+`make check` flow). There is no browser integration test for this package yet.
 
-Translations in `po/*.po` are filtered per package by `pkg/lib/cockpit-po-plugin.js`
-using `#: pkg/app-health/…` source references. In a full autotools checkout,
-refresh template references via `make po/cockpit.pot` (`xgettext`, `html2po`,
-and `manifest2po` in `po/Makefile.am`) and merge into `po/*.po` with `msgmerge`.
+Menu `label` and `keywords` in `manifest.json` use English msgids (`docker`,
+`container`, `app`, `health`, `monitor`) with `zh_CN` translations in
+`po/zh_CN.po` (so Chinese keyword search works in the `zh_CN` locale while
+English locales search by English keywords). Translations in `po/*.po` are
+filtered per package by `pkg/lib/cockpit-po-plugin.js` using
+`#: pkg/app-health/…` source references. In a full autotools checkout, refresh
+template references via `make po/cockpit.pot` (`xgettext`, `html2po`, and
+`manifest2po` in `po/Makefile.am`) and merge into `po/*.po` with `msgmerge`.
 
 ## Build (in this monorepo)
 

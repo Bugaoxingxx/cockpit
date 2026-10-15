@@ -10,6 +10,10 @@ import {
     containerMatchesFilter,
     createRefreshController,
     DEFAULT_LABEL_SELECTORS,
+    defaultInspectWarning,
+    defaultRefreshTimeoutMessage,
+    defaultSpawnTimeoutMessage,
+    defaultStatsWarning,
     dockerInspectAll,
     dockerStatsForIds,
     formatWarningTimestamp,
@@ -375,6 +379,60 @@ QUnit.test("dockerStatsForIds and dockerInspectAll cap concurrency across batche
     assert.strictEqual(maxRetryInFlight, MAX_CONCURRENT_SPAWNS, `multi-batch per-ID retry concurrency capped at MAX_CONCURRENT_SPAWNS (${MAX_CONCURRENT_SPAWNS})`);
 });
 
+QUnit.test("dockerInspectAll and dockerStatsForIds do not retry per ID on non-No-such batch errors and skip remaining queued batches", async assert => {
+    let inspectCalls = 0;
+    const spawnInspectDaemonErr = async () => {
+        inspectCalls += 1;
+        throw new Error("Cannot connect to the Docker daemon");
+    };
+    await assert.rejects(
+        dockerInspectAll(["id1", "id2", "id3"], spawnInspectDaemonErr),
+        /Cannot connect to the Docker daemon/,
+        "batch daemon error fails fast"
+    );
+    assert.strictEqual(inspectCalls, 1, "dockerInspectAll does not retry individual IDs when batch fails with daemon error");
+
+    let statsCalls = 0;
+    const spawnStatsTimeoutErr = async () => {
+        statsCalls += 1;
+        throw new Error("docker stats timed out after 15000ms");
+    };
+    await assert.rejects(
+        dockerStatsForIds(["id1", "id2", "id3"], spawnStatsTimeoutErr),
+        /docker stats timed out after 15000ms/,
+        "batch timeout fails fast"
+    );
+    assert.strictEqual(statsCalls, 1, "dockerStatsForIds does not retry individual IDs when batch fails with timeout");
+
+    // 250 containers = 5 batches of 50; when the first wave fails with a daemon error, queued batch 5 is skipped
+    const fiveBatchesIds = Array.from({ length: 250 }, (_, i) => `cid${String(i).padStart(9, "0")}`);
+    let multiBatchCalls = 0;
+    await assert.rejects(
+        dockerInspectAll(fiveBatchesIds, async () => {
+            multiBatchCalls += 1;
+            throw new Error("Cannot connect to the Docker daemon");
+        }),
+        /Cannot connect to the Docker daemon/
+    );
+    assert.ok(multiBatchCalls <= MAX_CONCURRENT_SPAWNS, `multi-batch daemon failure stopped before scheduling all 5 batches (ran ${multiBatchCalls})`);
+
+    // Direct dockerInspectAll call with AbortSignal terminates in-flight process and frees globalSpawnLimiter
+    let directClosed = null;
+    const ac = new AbortController();
+    const pendingInspect = dockerInspectAll(["id1"], () => {
+        const p = new Promise(() => {});
+        p.close = reason => { directClosed = reason };
+        return p;
+    }, { signal: ac.signal });
+    setTimeout(() => ac.abort(), 10);
+    await assert.rejects(
+        pendingInspect,
+        err => err.code === "ABORT_ERR",
+        "direct dockerInspectAll with AbortSignal rejects immediately on abort"
+    );
+    assert.strictEqual(directClosed, "terminated", "direct dockerInspectAll terminates in-flight process on abort");
+});
+
 QUnit.test("loadContainers aggregates multiple errors and preserves surviving stats", async assert => {
     assert.strictEqual(
         summarizeErrors([new Error("err A"), new Error("err B"), new Error("err A")]),
@@ -401,7 +459,7 @@ QUnit.test("loadContainers aggregates multiple errors and preserves surviving st
         if (args[0] === "stats") {
             const ids = args.slice(4);
             if (ids.length > 1)
-                throw new Error("batch stats failed");
+                throw new Error("Error response from daemon: No such container: vanished-during-stats");
             if (ids[0] === "aaa111222333")
                 return JSON.stringify({ ID: "aaa111222333", Name: "/web-1", CPUPerc: "5.5%", MemUsage: "32MiB / 1GiB" });
             if (ids[0] === "bbb444555666")
@@ -437,7 +495,7 @@ QUnit.test("loadContainers aggregates multiple errors and preserves surviving st
     assert.ok(res2.warning.includes("inspect permission denied"));
 });
 
-QUnit.test("withSpawnTimeout terminates hung docker commands", async assert => {
+QUnit.test("withSpawnTimeout terminates hung docker commands on timeout and on AbortSignal", async assert => {
     let closedWith = null;
     const hungSpawn = () => {
         const p = new Promise(() => {});
@@ -448,16 +506,37 @@ QUnit.test("withSpawnTimeout terminates hung docker commands", async assert => {
     const timedSpawn = withSpawnTimeout(hungSpawn, 20);
     await assert.rejects(
         timedSpawn(["inspect", "abc"]),
-        /docker inspect timed out after 20ms/,
-        "rejects when spawn exceeds timeoutMs"
+        err => err.code === "SPAWN_TIMEOUT" && /docker inspect timed out after 20ms/.test(err.message),
+        "rejects with SPAWN_TIMEOUT when spawn exceeds timeoutMs"
     );
     assert.strictEqual(closedWith, "terminated", "calls proc.close('terminated') on timeout");
+
+    let abortedProcClosedWith = null;
+    const abortController = new AbortController();
+    const abortableSpawn = withSpawnTimeout(() => {
+        const p = new Promise(() => {});
+        p.close = reason => { abortedProcClosedWith = reason };
+        return p;
+    }, 5000, {
+        signal: abortController.signal,
+        formatTimeoutError: (subcmd, ms) => `${subcmd} 超时 (${ms}ms)`,
+    });
+    const pending = abortableSpawn(["stats", "abc"]);
+    setTimeout(() => abortController.abort(), 10);
+    await assert.rejects(
+        pending,
+        err => err.code === "ABORT_ERR",
+        "rejects immediately with ABORT_ERR when signal aborts"
+    );
+    assert.strictEqual(abortedProcClosedWith, "terminated", "calls proc.close('terminated') on AbortSignal");
 });
 
-QUnit.test("createRefreshController preempts in-flight refreshes on manual refresh, enforces timeout, and tracks dated warnings", async assert => {
-    assert.strictEqual(
-        formatWarningTimestamp(new Date(2026, 9, 15, 10, 5, 8)),
-        "2026-10-15 10:05:08"
+QUnit.test("createRefreshController preempts in-flight refreshes on manual refresh, enforces timeout, and tracks dated warnings with timezone", async assert => {
+    const sampleDate = new Date(2026, 9, 15, 10, 5, 8);
+    const sampleTs = formatWarningTimestamp(sampleDate);
+    assert.ok(
+        /^2026-10-15 10:05:08 [+-]\d{2}:\d{2}$/.test(sampleTs),
+        `timestamp includes date, time, and timezone offset: ${sampleTs}`
     );
 
     let loadCalls = 0;
@@ -498,7 +577,7 @@ QUnit.test("createRefreshController preempts in-flight refreshes on manual refre
 
     // 1. Start background refresh #1 (stays in flight)
     const pBg = controller.refresh({ background: true });
-    assert.strictEqual(controller.getState().inFlightCount, 1);
+    assert.strictEqual("inFlightCount" in controller.getState(), false, "unused inFlightCount is not exposed in state");
 
     // Another background tick while #1 is in flight is skipped
     const skippedBg = await controller.refresh({ background: true });
@@ -523,41 +602,46 @@ QUnit.test("createRefreshController preempts in-flight refreshes on manual refre
     await pSlowManual;
     resolveBg();
     await pBg;
-    assert.strictEqual(controller.getState().inFlightCount, 0);
-    assert.strictEqual(lastEmittedState.inFlightCount, 0, "onStateChange stays in sync when preempted refreshes finish");
     assert.strictEqual(lastEmittedState.loading, false, "loading remains false after stale manual refresh finishes");
     assert.deepEqual(controller.getState().containers.map(c => c.id), ["fresh"], "stale preempted results ignored");
 
-    // 4. Background failure increments consecutiveFailures and includes YYYY-MM-DD HH:MM:SS
+    // 4. Background failure increments consecutiveFailures and includes YYYY-MM-DD HH:MM:SS ±HH:MM
     mode = "bg-fail-1";
     fakeClock = new Date(2026, 9, 15, 10, 5, 16);
+    const expectedTs1 = formatWarningTimestamp(fakeClock);
     await controller.refresh({ background: true });
     assert.strictEqual(controller.getState().consecutiveFailures, 1);
-    assert.strictEqual(controller.getState().lastWarningAt, "2026-10-15 10:05:16");
+    assert.strictEqual(controller.getState().lastWarningAt, expectedTs1);
     assert.strictEqual(
         controller.getState().warning,
-        "[2026-10-15 10:05:16, consecutive failures: 1] daemon temporary error"
+        `[${expectedTs1}, consecutive failures: 1] daemon temporary error`
     );
     assert.strictEqual(controller.getState().containers.length, 1, "preserves previous container list on background failure");
 
     // 5. Partial warning on successful load resets consecutiveFailures to 0 and does not claim consecutive failures
     mode = "bg-partial-warn";
     fakeClock = new Date(2026, 9, 15, 10, 5, 24);
+    const expectedTs2 = formatWarningTimestamp(fakeClock);
     await controller.refresh({ background: true });
     assert.strictEqual(controller.getState().consecutiveFailures, 0, "partial warning does not inflate consecutiveFailures");
-    assert.strictEqual(controller.getState().lastWarningAt, "2026-10-15 10:05:24");
+    assert.strictEqual(controller.getState().lastWarningAt, expectedTs2);
     assert.strictEqual(
         controller.getState().warning,
-        "[2026-10-15 10:05:24] partial stats failure"
+        `[${expectedTs2}] partial stats failure`
     );
 
-    // 6. Hung refresh times out via timeoutMs and does not permanently block future refreshes
+    // 6. Hung manual refresh times out via timeoutMs, includes timestamp + failure count on error page, and does not block future refreshes
     mode = "hang";
     fakeClock = new Date(2026, 9, 15, 10, 5, 32);
+    const expectedTs3 = formatWarningTimestamp(fakeClock);
     await controller.refresh({ background: false });
-    assert.strictEqual(controller.getState().inFlightCount, 0, "inFlightCount resets after timeout");
     assert.strictEqual(controller.getState().loading, false, "loading resets after timeout");
-    assert.ok(controller.getState().error.includes("timed out"), "timeout error surfaced");
+    assert.strictEqual(controller.getState().consecutiveFailures, 1, "manual failure increments consecutiveFailures");
+    assert.strictEqual(
+        controller.getState().error,
+        `[${expectedTs3}, consecutive failures: 1] Refresh timed out after 30ms`,
+        "manual error includes timestamp with timezone and consecutive failure count"
+    );
 
     // 7. Subsequent clean refresh succeeds after timeout recovery
     mode = "ok";
@@ -565,6 +649,86 @@ QUnit.test("createRefreshController preempts in-flight refreshes on manual refre
     assert.strictEqual(controller.getState().error, null);
     assert.strictEqual(controller.getState().warning, null);
     assert.strictEqual(controller.getState().consecutiveFailures, 0);
+});
+
+QUnit.test("createRefreshController aborts underlying loadContainers on round timeout and prevents zombie rounds from stacking", async assert => {
+    // 250 containers = 5 inspect batches of 50 (only 4 can run concurrently, 5th batch is queued)
+    const psLines = Array.from({ length: 250 }, (_, i) =>
+        JSON.stringify({ ID: `cid${String(i).padStart(9, "0")}`, Names: `app-${i}`, Status: "Up 1 hour" })
+    ).join("\n");
+
+    let activeProcs = 0;
+    let maxActiveProcs = 0;
+    let terminatedProcs = 0;
+    let totalInspectSpawns = 0;
+    let hangInspect = true;
+
+    const spawn = args => {
+        if (args[0] === "ps")
+            return Promise.resolve(psLines);
+        if (args[0] === "inspect") {
+            totalInspectSpawns += 1;
+            if (hangInspect) {
+                activeProcs += 1;
+                maxActiveProcs = Math.max(maxActiveProcs, activeProcs);
+                const p = new Promise(() => {});
+                p.close = reason => {
+                    if (reason === "terminated") {
+                        terminatedProcs += 1;
+                        activeProcs -= 1;
+                    }
+                };
+                return p;
+            }
+            const batch = args.slice(3);
+            return Promise.resolve(
+                batch.map(id => JSON.stringify({
+                    Id: id,
+                    Name: `/${id}`,
+                    RestartCount: 0,
+                    Config: { Labels: { "cockpit.app-health": "true" } },
+                    State: { Status: "running" },
+                })).join("\n")
+            );
+        }
+        if (args[0] === "stats") {
+            const batch = args.slice(4);
+            return Promise.resolve(
+                batch.map(id => JSON.stringify({ ID: id, CPUPerc: "1.0%", MemUsage: "10MiB" })).join("\n")
+            );
+        }
+        return Promise.reject(new Error("unexpected"));
+    };
+
+    const filter = { namePrefixes: [], labelSelectors: ["cockpit.app-health=true"] };
+    const controller = createRefreshController({
+        load: ({ signal }) => loadContainers(filter, {
+            spawn,
+            signal,
+            timeoutMs: 5000, // per-command timeout longer than round timeout
+        }),
+        timeoutMs: 25, // round timeout fires first
+    });
+
+    // Round 1: times out at 25ms while 4 inspect batches are hung and 1 batch is queued
+    await controller.refresh({ background: false });
+    assert.strictEqual(maxActiveProcs, MAX_CONCURRENT_SPAWNS, "at most MAX_CONCURRENT_SPAWNS processes ran in round 1");
+    assert.strictEqual(totalInspectSpawns, MAX_CONCURRENT_SPAWNS, "queued 5th batch was cancelled on round timeout before spawning");
+    assert.strictEqual(terminatedProcs, MAX_CONCURRENT_SPAWNS, "all 4 in-flight inspect processes were terminated on round timeout");
+    assert.strictEqual(activeProcs, 0, "zero zombie processes left running after round 1 timeout");
+
+    // Round 2 (simulating next 8s tick while daemon is still hung): also capped and cleaned up without stacking
+    await controller.refresh({ background: true });
+    assert.strictEqual(maxActiveProcs, MAX_CONCURRENT_SPAWNS, "global concurrency never exceeded MAX_CONCURRENT_SPAWNS across rounds");
+    assert.strictEqual(activeProcs, 0, "zero zombie processes left running after round 2 timeout");
+    assert.strictEqual(controller.getState().consecutiveFailures, 2);
+
+    // Round 3: daemon recovers
+    hangInspect = false;
+    await controller.refresh({ background: true });
+    assert.strictEqual(controller.getState().consecutiveFailures, 0);
+    assert.strictEqual(controller.getState().warning, null);
+    assert.strictEqual(controller.getState().containers.length, 250);
 });
 
 QUnit.test("dockerInspectAll and loadContainers ignore containers vanishing with No such object before inspect", async assert => {
@@ -647,9 +811,7 @@ QUnit.test("loadContainers validates filter once per call and background refresh
     });
     await controller.refresh({ background: false });
     assert.strictEqual(emittedStates.length, 2, "manual refresh emits once on start and once on completion");
-    assert.strictEqual(emittedStates[0].inFlightCount, 1);
     assert.strictEqual(emittedStates[0].loading, true);
-    assert.strictEqual(emittedStates[1].inFlightCount, 0);
     assert.strictEqual(emittedStates[1].loading, false);
     assert.strictEqual(emittedStates[1].containers.length, 1);
 
@@ -658,4 +820,42 @@ QUnit.test("loadContainers validates filter once per call and background refresh
     assert.strictEqual(emittedStates.length, 1, "background refresh only emits on completion so UI buttons do not flash every 8s");
     assert.strictEqual(emittedStates[0].loading, false);
 });
+
+QUnit.test("default warnings and timeout messages use cockpit.gettext when available", assert => {
+    const prevCockpit = globalThis.cockpit;
+    try {
+        const dict = {
+            "Could not inspect containers (restart counts and labels may be incomplete): $0":
+                "无法 inspect 容器（重启次数与标签可能不完整）：$0",
+            "Could not read container stats (CPU/memory unavailable): $0":
+                "无法读取容器 stats（CPU/内存不可用）：$0",
+            "$0 timed out after $1ms": "$0 在 $1 毫秒后超时",
+            "Refresh timed out after $0ms": "刷新在 $0 毫秒后超时",
+        };
+        globalThis.cockpit = {
+            gettext: s => dict[s] || s,
+            format: (tmpl, ...args) => tmpl.replace(/\$(\d+)/g, (m, i) => String(args[Number(i)] ?? m)),
+        };
+
+        assert.strictEqual(
+            defaultInspectWarning("err1"),
+            "无法 inspect 容器（重启次数与标签可能不完整）：err1"
+        );
+        assert.strictEqual(
+            defaultStatsWarning("err2"),
+            "无法读取容器 stats（CPU/内存不可用）：err2"
+        );
+        assert.strictEqual(
+            defaultSpawnTimeoutMessage("docker inspect", 15000),
+            "docker inspect 在 15000 毫秒后超时"
+        );
+        assert.strictEqual(
+            defaultRefreshTimeoutMessage(30000),
+            "刷新在 30000 毫秒后超时"
+        );
+    } finally {
+        globalThis.cockpit = prevCockpit;
+    }
+});
+
 

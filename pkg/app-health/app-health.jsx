@@ -108,14 +108,19 @@ const ContainerList = () => {
         error: null,
         warning: null,
         loading: true,
-        inFlightCount: 0,
         consecutiveFailures: 0,
         lastWarningAt: null,
     });
 
     const controller = useMemo(() => createRefreshController({
-        load: () => loadContainers(filter, {
+        load: ({ signal } = {}) => loadContainers(filter, {
             spawn: dockerSpawn,
+            signal,
+            formatSpawnTimeout: (subcmd, timeoutMs) => cockpit.format(
+                _("$0 timed out after $1ms"),
+                subcmd,
+                timeoutMs
+            ),
             formatInspectWarning: msg => cockpit.format(
                 _("Could not inspect containers (restart counts and labels may be incomplete): $0"),
                 msg
@@ -125,6 +130,10 @@ const ContainerList = () => {
                 msg
             ),
         }),
+        formatTimeoutError: timeoutMs => cockpit.format(
+            _("Refresh timed out after $0ms"),
+            timeoutMs
+        ),
         formatWarningMeta: (msg, time, count) => count > 0
             ? cockpit.format(
                 _("[$0, consecutive failures: $1] $2"),
@@ -185,7 +194,7 @@ const ContainerList = () => {
 
     const configAlert = filter.configWarning && (
         <Alert variant="warning" isInline className="app-health-warning"
-               title={_("Invalid filter configuration in manifest")}>
+               title={_("Container filter configuration notice")}>
             <p>{filter.configWarning}</p>
         </Alert>
     );

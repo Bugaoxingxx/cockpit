@@ -11,6 +11,47 @@ export const DEFAULT_SPAWN_TIMEOUT_MS = 15000;
 export const DEFAULT_REFRESH_TIMEOUT_MS = 30000;
 export const LIST_REFRESH_MS = 8000;
 
+const LIMITED_SPAWN_SYMBOL = Symbol.for("cockpit.app-health.limitedSpawn");
+const SPAWN_SIGNAL_SYMBOL = Symbol.for("cockpit.app-health.spawnSignal");
+
+function _(msgid) {
+    const gettext = globalThis.cockpit?.gettext;
+    return typeof gettext === "function" ? gettext(msgid) : msgid;
+}
+
+function formatMsg(template, ...args) {
+    const fmt = globalThis.cockpit?.format;
+    if (typeof fmt === "function")
+        return fmt(template, ...args);
+    return String(template).replace(/\$(\d+)/g, (match, idx) => {
+        const i = Number(idx);
+        return i < args.length ? String(args[i]) : match;
+    });
+}
+
+export function createAbortError(message = "Refresh aborted") {
+    const err = new Error(message);
+    err.name = "AbortError";
+    err.code = "ABORT_ERR";
+    return err;
+}
+
+export function isAbortError(err) {
+    return Boolean(err && (err.name === "AbortError" || err.code === "ABORT_ERR" || err.code === 20));
+}
+
+function throwIfAborted(signal) {
+    if (!signal?.aborted)
+        return;
+    const reason = signal.reason;
+    if (reason instanceof Error && reason.code === "ABORT_ERR")
+        throw reason;
+    const msg = reason instanceof Error
+        ? reason.message
+        : (typeof reason === "string" && reason ? reason : undefined);
+    throw createAbortError(msg);
+}
+
 /** Parse NDJSON (one JSON object per line) from docker --format '{{json .}}'. */
 export function parseJsonLines(text) {
     const out = [];
@@ -51,6 +92,7 @@ export function chunkArray(items, size) {
 
 /**
  * Create a concurrency limiter (semaphore) that runs at most `limit` async functions at once.
+ * Supports an optional `AbortSignal` so queued tasks are immediately dequeued and rejected on abort.
  */
 export function createConcurrencyLimiter(limit = MAX_CONCURRENT_SPAWNS) {
     const max = Math.max(1, Number(limit) || MAX_CONCURRENT_SPAWNS);
@@ -59,11 +101,21 @@ export function createConcurrencyLimiter(limit = MAX_CONCURRENT_SPAWNS) {
 
     const next = () => {
         while (active < max && queue.length > 0) {
+            const entry = queue.shift();
+            if (entry.cleanupAbort)
+                entry.cleanupAbort();
+            if (entry.signal?.aborted) {
+                try {
+                    throwIfAborted(entry.signal);
+                } catch (err) {
+                    entry.reject(err);
+                }
+                continue;
+            }
             active += 1;
-            const { fn, resolve, reject } = queue.shift();
             Promise.resolve()
-                    .then(fn)
-                    .then(resolve, reject)
+                    .then(entry.fn)
+                    .then(entry.resolve, entry.reject)
                     .finally(() => {
                         active -= 1;
                         next();
@@ -71,16 +123,75 @@ export function createConcurrencyLimiter(limit = MAX_CONCURRENT_SPAWNS) {
         }
     };
 
-    return fn => new Promise((resolve, reject) => {
-        queue.push({ fn, resolve, reject });
+    return (fn, signal) => new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            try {
+                throwIfAborted(signal);
+            } catch (err) {
+                reject(err);
+            }
+            return;
+        }
+        const entry = { fn, resolve, reject, signal, cleanupAbort: null };
+        if (signal && typeof signal.addEventListener === "function") {
+            const onAbort = () => {
+                const idx = queue.indexOf(entry);
+                if (idx !== -1)
+                    queue.splice(idx, 1);
+                entry.cleanupAbort = null;
+                try {
+                    throwIfAborted(signal);
+                } catch (err) {
+                    reject(err);
+                }
+            };
+            signal.addEventListener("abort", onAbort, { once: true });
+            entry.cleanupAbort = () => signal.removeEventListener("abort", onAbort);
+        }
+        queue.push(entry);
         next();
     });
 }
 
+/** Module-level shared spawn concurrency limiter across all refresh rounds. */
+export const globalSpawnLimiter = createConcurrencyLimiter(MAX_CONCURRENT_SPAWNS);
+
+function resolveSpawnLimiter(options = {}) {
+    if (typeof options.limiter === "function")
+        return options.limiter;
+    if (options.concurrency !== undefined && Number(options.concurrency) !== MAX_CONCURRENT_SPAWNS)
+        return createConcurrencyLimiter(options.concurrency);
+    return globalSpawnLimiter;
+}
+
+function toLimitedSpawn(spawn, options = {}) {
+    const signal = options.signal;
+    if (spawn && spawn[LIMITED_SPAWN_SYMBOL]) {
+        if (!signal || spawn[SPAWN_SIGNAL_SYMBOL] === signal)
+            return spawn;
+        return withSpawnTimeout(spawn, 0, { signal });
+    }
+    const limiter = resolveSpawnLimiter(options);
+    const abortableSpawn = signal && spawn?.[SPAWN_SIGNAL_SYMBOL] !== signal
+        ? withSpawnTimeout(spawn, 0, { signal })
+        : spawn;
+    const wrapped = (args, spawnOpts) => limiter(() => {
+        throwIfAborted(signal);
+        return abortableSpawn(args, spawnOpts);
+    }, signal);
+    wrapped[LIMITED_SPAWN_SYMBOL] = true;
+    if (signal)
+        wrapped[SPAWN_SIGNAL_SYMBOL] = signal;
+    return wrapped;
+}
+
 /**
  * Map `items` with at most `concurrency` workers active in parallel.
+ * Stops scheduling further items immediately when `options.signal` is aborted.
  */
-export async function mapWithConcurrency(items, concurrency, mapper) {
+export async function mapWithConcurrency(items, concurrency, mapper, options = {}) {
+    const signal = options?.signal;
+    throwIfAborted(signal);
     const list = Array.from(items || []);
     if (list.length === 0)
         return [];
@@ -90,6 +201,7 @@ export async function mapWithConcurrency(items, concurrency, mapper) {
 
     const worker = async () => {
         while (nextIndex < list.length) {
+            throwIfAborted(signal);
             const idx = nextIndex++;
             results[idx] = await mapper(list[idx], idx);
         }
@@ -99,33 +211,98 @@ export async function mapWithConcurrency(items, concurrency, mapper) {
     return results;
 }
 
+export function defaultSpawnTimeoutMessage(subcmd, timeoutMs) {
+    return formatMsg(_("$0 timed out after $1ms"), subcmd, timeoutMs);
+}
+
+export function defaultRefreshTimeoutMessage(timeoutMs) {
+    return formatMsg(_("Refresh timed out after $0ms"), timeoutMs);
+}
+
 /**
- * Wrap a `spawn(args, options)` function with a timeout so hung `docker` CLI processes
- * are terminated (`proc.close("terminated")`) and rejected instead of blocking forever.
+ * Wrap a `spawn(args, options)` function with a timeout and optional `AbortSignal` so hung or
+ * superseded `docker` CLI processes are terminated (`proc.close("terminated")`) and rejected
+ * instead of blocking or leaking in the background.
  */
-export function withSpawnTimeout(spawn, timeoutMs = DEFAULT_SPAWN_TIMEOUT_MS) {
-    if (!timeoutMs || timeoutMs <= 0)
+export function withSpawnTimeout(spawn, timeoutMs = DEFAULT_SPAWN_TIMEOUT_MS, options = {}) {
+    const signal = options?.signal;
+    const formatTimeoutError = options?.formatTimeoutError || defaultSpawnTimeoutMessage;
+    const hasTimeout = Boolean(timeoutMs && timeoutMs > 0);
+    if (!hasTimeout && (!signal || spawn?.[SPAWN_SIGNAL_SYMBOL] === signal))
         return spawn;
-    return (args, options) => new Promise((resolve, reject) => {
+
+    const wrapped = (args, spawnOptions) => new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            try {
+                throwIfAborted(signal);
+            } catch (err) {
+                reject(err);
+            }
+            return;
+        }
+
         let settled = false;
         let proc;
-        const timer = setTimeout(() => {
-            if (settled)
-                return;
-            settled = true;
+        let timer = null;
+        let cleanupAbort = null;
+
+        const terminateProc = () => {
             try {
                 proc?.close?.("terminated");
             } catch (e) {
-                // ignore close errors on timed-out process
+                // ignore close errors on timed-out or aborted process
             }
-            const subcmd = Array.isArray(args) && args[0] ? `docker ${args[0]}` : "docker command";
-            reject(new Error(`${subcmd} timed out after ${timeoutMs}ms`));
-        }, timeoutMs);
+        };
+
+        const cleanup = () => {
+            if (timer !== null) {
+                clearTimeout(timer);
+                timer = null;
+            }
+            if (cleanupAbort) {
+                cleanupAbort();
+                cleanupAbort = null;
+            }
+        };
+
+        if (signal && typeof signal.addEventListener === "function") {
+            const onAbort = () => {
+                if (settled)
+                    return;
+                settled = true;
+                cleanup();
+                terminateProc();
+                try {
+                    throwIfAborted(signal);
+                } catch (err) {
+                    reject(err);
+                }
+            };
+            signal.addEventListener("abort", onAbort, { once: true });
+            cleanupAbort = () => signal.removeEventListener("abort", onAbort);
+        }
+
+        if (hasTimeout) {
+            timer = setTimeout(() => {
+                if (settled)
+                    return;
+                settled = true;
+                cleanup();
+                terminateProc();
+                const subcmd = Array.isArray(args) && args[0] ? `docker ${args[0]}` : "docker command";
+                const err = new Error(formatTimeoutError(subcmd, timeoutMs));
+                err.code = "SPAWN_TIMEOUT";
+                err.command = subcmd;
+                err.timeoutMs = timeoutMs;
+                reject(err);
+            }, timeoutMs);
+        }
 
         try {
-            proc = spawn(args, options);
+            proc = spawn(args, spawnOptions);
         } catch (err) {
-            clearTimeout(timer);
+            settled = true;
+            cleanup();
             reject(err);
             return;
         }
@@ -135,18 +312,23 @@ export function withSpawnTimeout(spawn, timeoutMs = DEFAULT_SPAWN_TIMEOUT_MS) {
                 if (settled)
                     return;
                 settled = true;
-                clearTimeout(timer);
+                cleanup();
                 resolve(val);
             },
             err => {
                 if (settled)
                     return;
                 settled = true;
-                clearTimeout(timer);
+                cleanup();
                 reject(err);
             }
         );
     });
+    if (spawn?.[LIMITED_SPAWN_SYMBOL])
+        wrapped[LIMITED_SPAWN_SYMBOL] = true;
+    if (signal)
+        wrapped[SPAWN_SIGNAL_SYMBOL] = signal;
+    return wrapped;
 }
 
 export function summarizeErrors(errors) {
@@ -189,23 +371,26 @@ export function parseLabelSelector(selector) {
  * Return trimmed, non-empty name prefixes from filter config.
  * Warns on and skips non-string or empty/whitespace-only entries.
  */
-export function activeNamePrefixes(filter) {
-    const raw = filter?.namePrefixes;
+export function activeNamePrefixes(filter, callbacks = {}) {
+    const raw = filter?.namePrefixes ?? filter?.["name-prefixes"];
     if (raw === undefined || raw === null)
         return [];
     if (!Array.isArray(raw)) {
         console.warn("app-health: ignoring invalid namePrefixes (expected array)", raw);
+        callbacks.onInvalidType?.(raw);
         return [];
     }
     const out = [];
     for (const p of raw) {
         if (typeof p !== "string") {
             console.warn("app-health: ignoring non-string name prefix", p);
+            callbacks.onInvalidEntry?.(p);
             continue;
         }
         const trimmed = p.trim();
         if (!trimmed) {
             console.warn("app-health: ignoring empty name prefix", p);
+            callbacks.onInvalidEntry?.(p);
             continue;
         }
         out.push(trimmed);
@@ -217,28 +402,32 @@ export function activeNamePrefixes(filter) {
  * Return trimmed, validated label selectors from filter config.
  * Warns on and skips non-string, empty, or malformed selectors (e.g. `=val` or whitespace in key).
  */
-export function activeLabelSelectors(filter) {
-    const raw = filter?.labelSelectors;
+export function activeLabelSelectors(filter, callbacks = {}) {
+    const raw = filter?.labelSelectors ?? filter?.["label-selectors"];
     if (raw === undefined || raw === null)
         return [];
     if (!Array.isArray(raw)) {
         console.warn("app-health: ignoring invalid labelSelectors (expected array)", raw);
+        callbacks.onInvalidType?.(raw);
         return [];
     }
     const out = [];
     for (const s of raw) {
         if (typeof s !== "string") {
             console.warn("app-health: ignoring non-string label selector", s);
+            callbacks.onInvalidEntry?.(s);
             continue;
         }
         const trimmed = s.trim();
         if (!trimmed) {
             console.warn("app-health: ignoring empty label selector", s);
+            callbacks.onInvalidEntry?.(s);
             continue;
         }
         const { key, value } = parseLabelSelector(trimmed);
         if (!isValidLabelKey(key)) {
             console.warn("app-health: ignoring invalid label selector", s);
+            callbacks.onInvalidEntry?.(s);
             continue;
         }
         out.push(value === null || value === "" ? key : `${key}=${value}`);
@@ -247,21 +436,24 @@ export function activeLabelSelectors(filter) {
 }
 
 const DEFAULT_CONFIG_MESSAGES = {
-    invalidNamePrefixesType: () => "name-prefixes must be an array of non-empty strings",
-    invalidNamePrefixEntry: entry => `ignored invalid name-prefixes entry: ${entry}`,
-    invalidLabelSelectorsType: fallback =>
-        `label-selectors must be an array; falling back to default (${fallback})`,
-    invalidLabelSelectorEntry: entry => `ignored invalid label-selectors entry: ${entry}`,
+    invalidNamePrefixesType: () => _("name-prefixes must be an array of non-empty strings"),
+    invalidNamePrefixEntry: entry => formatMsg(_("ignored invalid name-prefixes entry: $0"), entry),
+    invalidLabelSelectorsType: fallback => formatMsg(
+        _("label-selectors must be an array; falling back to default ($0)"),
+        fallback
+    ),
+    invalidLabelSelectorEntry: entry => formatMsg(_("ignored invalid label-selectors entry: $0"), entry),
     noActiveFilterRules: () =>
-        "no effective filter rules are active (both name-prefixes and label-selectors are empty); no containers will match",
+        _("no effective filter rules are active (both name-prefixes and label-selectors are empty); no containers will match"),
 };
 
 /**
- * Validate raw manifest `config` (`name-prefixes` / `label-selectors`) and return normalized
- * filter arrays along with user-visible `configIssues` / `configWarning`.
+ * Validate raw manifest `config` (`name-prefixes` / `label-selectors`) by reusing
+ * `activeNamePrefixes` and `activeLabelSelectors`, returning normalized filter arrays
+ * along with user-visible `configIssues` / `configWarning`.
  * When `label-selectors` is not an array (e.g. misconfigured as a string or number),
  * falls back to `defaultLabelSelectors` instead of silently showing an empty list.
- * When both effective `namePrefixes` and `labelSelectors` end up empty, records a warning
+ * When both effective `namePrefixes` and `labelSelectors` end up empty, records a notice
  * so the user knows why no containers can match.
  */
 export function resolveFilterConfig(
@@ -271,48 +463,26 @@ export function resolveFilterConfig(
 ) {
     const fmt = { ...DEFAULT_CONFIG_MESSAGES, ...messages };
     const cfg = rawConfig && typeof rawConfig === "object" ? rawConfig : {};
-    const rawPrefixes = cfg["name-prefixes"] ?? cfg.namePrefixes;
     const rawSelectors = cfg["label-selectors"] ?? cfg.labelSelectors;
     const configIssues = [];
 
-    const namePrefixes = [];
-    if (rawPrefixes !== undefined && rawPrefixes !== null) {
-        if (!Array.isArray(rawPrefixes)) {
-            console.warn("app-health: ignoring invalid name-prefixes (expected array)", rawPrefixes);
-            configIssues.push(fmt.invalidNamePrefixesType());
-        } else {
-            for (const p of rawPrefixes) {
-                if (typeof p !== "string" || !p.trim()) {
-                    console.warn("app-health: ignoring invalid name prefix", p);
-                    configIssues.push(fmt.invalidNamePrefixEntry(JSON.stringify(p)));
-                    continue;
-                }
-                namePrefixes.push(p.trim());
-            }
-        }
-    }
+    const namePrefixes = activeNamePrefixes(cfg, {
+        onInvalidType: () => configIssues.push(fmt.invalidNamePrefixesType()),
+        onInvalidEntry: p => configIssues.push(fmt.invalidNamePrefixEntry(JSON.stringify(p))),
+    });
 
     let labelSelectors = [];
     if (rawSelectors === undefined || rawSelectors === null) {
         labelSelectors = activeLabelSelectors({ labelSelectors: defaultLabelSelectors });
-    } else if (!Array.isArray(rawSelectors)) {
-        console.warn("app-health: ignoring invalid label-selectors (expected array), falling back to default", rawSelectors);
-        labelSelectors = activeLabelSelectors({ labelSelectors: defaultLabelSelectors });
-        configIssues.push(fmt.invalidLabelSelectorsType(labelSelectors.join(", ")));
     } else {
-        for (const s of rawSelectors) {
-            if (typeof s !== "string" || !s.trim()) {
-                console.warn("app-health: ignoring invalid label selector", s);
-                configIssues.push(fmt.invalidLabelSelectorEntry(JSON.stringify(s)));
-                continue;
-            }
-            const { key, value } = parseLabelSelector(s.trim());
-            if (!isValidLabelKey(key)) {
-                console.warn("app-health: ignoring invalid label selector", s);
-                configIssues.push(fmt.invalidLabelSelectorEntry(JSON.stringify(s)));
-                continue;
-            }
-            labelSelectors.push(value === null || value === "" ? key : `${key}=${value}`);
+        let invalidSelectorType = false;
+        labelSelectors = activeLabelSelectors(cfg, {
+            onInvalidType: () => { invalidSelectorType = true },
+            onInvalidEntry: s => configIssues.push(fmt.invalidLabelSelectorEntry(JSON.stringify(s))),
+        });
+        if (invalidSelectorType) {
+            labelSelectors = activeLabelSelectors({ labelSelectors: defaultLabelSelectors });
+            configIssues.push(fmt.invalidLabelSelectorsType(labelSelectors.join(", ")));
         }
     }
 
@@ -514,18 +684,24 @@ export function isNoSuchContainerError(err) {
 
 /**
  * Inspect candidate container IDs in batches of `INSPECT_BATCH_SIZE` with bounded concurrency.
- * If a multi-ID batch fails (e.g. a container vanished mid-refresh), retries each ID
- * individually (also bounded by `concurrency`) so surviving containers still receive inspect metadata.
+ * Only when a multi-ID batch fails with a "No such container/object" error (a container vanished
+ * mid-refresh) does it retry each ID in that batch individually; timeouts or daemon errors fail
+ * the batch immediately without amplifying requests.
  * Returns `{ rows, errors, vanishedIds }`.
  */
 export async function dockerInspectAll(ids, spawn, options = {}) {
     const concurrency = options.concurrency || MAX_CONCURRENT_SPAWNS;
-    const runLimited = createConcurrencyLimiter(concurrency);
-    const limitedSpawn = args => runLimited(() => spawn(args));
+    const signal = options.signal;
+    throwIfAborted(signal);
+    const limitedSpawn = toLimitedSpawn(spawn, { concurrency, limiter: options.limiter, signal });
 
     const cleanIds = [...new Set((ids || []).filter(Boolean))];
     const batches = chunkArray(cleanIds, INSPECT_BATCH_SIZE);
+    let batchFailedFast = false;
     const batchResults = await mapWithConcurrency(batches, concurrency, async batch => {
+        throwIfAborted(signal);
+        if (batchFailedFast)
+            return { rows: [], errors: [], vanishedIds: [] };
         try {
             const inspectOut = await limitedSpawn([
                 "inspect",
@@ -534,15 +710,20 @@ export async function dockerInspectAll(ids, spawn, options = {}) {
             ]);
             return { rows: parseJsonLines(inspectOut), errors: [], vanishedIds: [] };
         } catch (err) {
-            if (batch.length <= 1) {
-                if (isNoSuchContainerError(err))
-                    return { rows: [], errors: [], vanishedIds: [...batch] };
+            if (signal?.aborted || isAbortError(err))
+                throw err;
+            if (!isNoSuchContainerError(err)) {
+                batchFailedFast = true;
                 return { rows: [], errors: [err], vanishedIds: [] };
             }
+            if (batch.length <= 1)
+                return { rows: [], errors: [], vanishedIds: [...batch] };
+
             const rows = [];
             const errors = [];
             const vanishedIds = [];
             await mapWithConcurrency(batch, concurrency, async id => {
+                throwIfAborted(signal);
                 try {
                     const out = await limitedSpawn([
                         "inspect",
@@ -551,15 +732,17 @@ export async function dockerInspectAll(ids, spawn, options = {}) {
                     ]);
                     rows.push(...parseJsonLines(out));
                 } catch (retryErr) {
+                    if (signal?.aborted || isAbortError(retryErr))
+                        throw retryErr;
                     if (isNoSuchContainerError(retryErr))
                         vanishedIds.push(id);
                     else
                         errors.push(retryErr);
                 }
-            });
+            }, { signal });
             return { rows, errors, vanishedIds };
         }
-    });
+    }, { signal });
 
     const rows = [];
     const errors = [];
@@ -580,18 +763,24 @@ export async function dockerInspectAll(ids, spawn, options = {}) {
 /**
  * Read one-shot `docker stats --no-stream` for `ids` in batches of `STATS_BATCH_SIZE`
  * with bounded concurrency.
- * When a batch fails (e.g. one container was removed during a rolling update), retries each ID
- * in that batch individually (bounded by `concurrency`) so other containers still get stats.
+ * Only when a multi-ID batch fails with a "No such container/object" error (one container was
+ * removed during a rolling update) does it retry each ID in that batch individually; timeouts or
+ * daemon errors fail the batch immediately without amplifying requests.
  * Returns `{ rows, errors, vanishedIds }`.
  */
 export async function dockerStatsForIds(ids, spawn, options = {}) {
     const concurrency = options.concurrency || MAX_CONCURRENT_SPAWNS;
-    const runLimited = createConcurrencyLimiter(concurrency);
-    const limitedSpawn = args => runLimited(() => spawn(args));
+    const signal = options.signal;
+    throwIfAborted(signal);
+    const limitedSpawn = toLimitedSpawn(spawn, { concurrency, limiter: options.limiter, signal });
 
     const cleanIds = [...new Set((ids || []).filter(Boolean))];
     const batches = chunkArray(cleanIds, STATS_BATCH_SIZE);
+    let batchFailedFast = false;
     const batchResults = await mapWithConcurrency(batches, concurrency, async batch => {
+        throwIfAborted(signal);
+        if (batchFailedFast)
+            return { rows: [], errors: [], vanishedIds: [] };
         try {
             const statsOut = await limitedSpawn([
                 "stats", "--no-stream", "--format", "{{json .}}",
@@ -599,15 +788,20 @@ export async function dockerStatsForIds(ids, spawn, options = {}) {
             ]);
             return { rows: parseJsonLines(statsOut), errors: [], vanishedIds: [] };
         } catch (err) {
-            if (batch.length <= 1) {
-                if (isNoSuchContainerError(err))
-                    return { rows: [], errors: [], vanishedIds: [...batch] };
+            if (signal?.aborted || isAbortError(err))
+                throw err;
+            if (!isNoSuchContainerError(err)) {
+                batchFailedFast = true;
                 return { rows: [], errors: [err], vanishedIds: [] };
             }
+            if (batch.length <= 1)
+                return { rows: [], errors: [], vanishedIds: [...batch] };
+
             const rows = [];
             const errors = [];
             const vanishedIds = [];
             await mapWithConcurrency(batch, concurrency, async id => {
+                throwIfAborted(signal);
                 try {
                     const singleOut = await limitedSpawn([
                         "stats", "--no-stream", "--format", "{{json .}}",
@@ -615,15 +809,17 @@ export async function dockerStatsForIds(ids, spawn, options = {}) {
                     ]);
                     rows.push(...parseJsonLines(singleOut));
                 } catch (retryErr) {
+                    if (signal?.aborted || isAbortError(retryErr))
+                        throw retryErr;
                     if (isNoSuchContainerError(retryErr))
                         vanishedIds.push(id);
                     else
                         errors.push(retryErr);
                 }
-            });
+            }, { signal });
             return { rows, errors, vanishedIds };
         }
-    });
+    }, { signal });
 
     const rows = [];
     const errors = [];
@@ -672,22 +868,26 @@ export async function fetchPsWithLabelSelector(selector, spawn) {
  */
 export async function gatherCandidates(filter, spawn, options = {}) {
     const concurrency = options.concurrency || MAX_CONCURRENT_SPAWNS;
+    const signal = options.signal;
+    throwIfAborted(signal);
+    const limitedSpawn = toLimitedSpawn(spawn, { concurrency, limiter: options.limiter, signal });
+
     const namePrefixes = activeNamePrefixes(filter);
     const labelSelectors = [...new Set(activeLabelSelectors(filter))];
 
     if (namePrefixes.length === 0 && labelSelectors.length === 0)
         return [];
 
-    const tasks = labelSelectors.map(sel => () => fetchPsWithLabelSelector(sel, spawn));
+    const tasks = labelSelectors.map(sel => () => fetchPsWithLabelSelector(sel, limitedSpawn));
     if (namePrefixes.length > 0) {
         tasks.push(() =>
-            fetchAllPsContainers(spawn).then(all =>
+            fetchAllPsContainers(limitedSpawn).then(all =>
                 all.filter(c => nameMatches(c.name, namePrefixes))
             )
         );
     }
 
-    const lists = await mapWithConcurrency(tasks, concurrency, task => task());
+    const lists = await mapWithConcurrency(tasks, concurrency, task => task(), { signal });
     let candidates = [];
     for (const list of lists)
         candidates = mergeContainersById(candidates, list);
@@ -695,31 +895,49 @@ export async function gatherCandidates(filter, spawn, options = {}) {
     return candidates;
 }
 
-function defaultInspectWarning(msg) {
-    return `Could not inspect containers (restart counts and labels may be incomplete): ${msg}`;
+export function defaultInspectWarning(msg) {
+    return formatMsg(
+        _("Could not inspect containers (restart counts and labels may be incomplete): $0"),
+        msg
+    );
 }
 
-function defaultStatsWarning(msg) {
-    return `Could not read container stats (CPU/memory unavailable): ${msg}`;
+export function defaultStatsWarning(msg) {
+    return formatMsg(
+        _("Could not read container stats (CPU/memory unavailable): $0"),
+        msg
+    );
 }
 
 /**
  * Load container list + restart counts + one-shot stats for filtered apps only.
  * `options` may be a `spawn(args)` function or
- * `{ spawn, concurrency, timeoutMs, formatInspectWarning, formatStatsWarning }`.
+ * `{ spawn, concurrency, limiter, timeoutMs, signal, formatSpawnTimeout, formatInspectWarning, formatStatsWarning }`.
  */
 export async function loadContainers(filter, options = {}) {
     const opts = typeof options === "function" ? { spawn: options } : (options || {});
     const rawSpawn = opts.spawn;
     const concurrency = opts.concurrency || MAX_CONCURRENT_SPAWNS;
     const timeoutMs = opts.timeoutMs === undefined ? DEFAULT_SPAWN_TIMEOUT_MS : opts.timeoutMs;
+    const signal = opts.signal;
     const formatInspectWarning = opts.formatInspectWarning || defaultInspectWarning;
     const formatStatsWarning = opts.formatStatsWarning || defaultStatsWarning;
+    const formatSpawnTimeout = opts.formatSpawnTimeout || defaultSpawnTimeoutMessage;
 
     if (typeof rawSpawn !== "function")
         throw new Error("loadContainers requires a spawn function");
 
-    const spawn = withSpawnTimeout(rawSpawn, timeoutMs);
+    throwIfAborted(signal);
+
+    const timedSpawn = withSpawnTimeout(rawSpawn, timeoutMs, {
+        signal,
+        formatTimeoutError: formatSpawnTimeout,
+    });
+    const spawn = toLimitedSpawn(timedSpawn, {
+        concurrency: opts.concurrency,
+        limiter: opts.limiter,
+        signal,
+    });
 
     const normalizedFilter = {
         namePrefixes: activeNamePrefixes(filter),
@@ -727,7 +945,9 @@ export async function loadContainers(filter, options = {}) {
     };
 
     let warning = null;
-    const candidates = await gatherCandidates(normalizedFilter, spawn, { concurrency });
+    const candidates = await gatherCandidates(normalizedFilter, spawn, { concurrency, signal });
+
+    throwIfAborted(signal);
 
     if (candidates.length === 0)
         return { containers: [], warning: null };
@@ -736,7 +956,7 @@ export async function loadContainers(filter, options = {}) {
     const inspectIds = candidates.map(c => c.id).filter(Boolean);
     if (inspectIds.length > 0) {
         try {
-            const inspectResult = await dockerInspectAll(inspectIds, spawn, { concurrency });
+            const inspectResult = await dockerInspectAll(inspectIds, spawn, { concurrency, signal });
             applyInspectMetadata(candidates, inspectResult.rows);
             if (inspectResult.vanishedIds)
                 vanishedIds = inspectResult.vanishedIds;
@@ -744,10 +964,14 @@ export async function loadContainers(filter, options = {}) {
                 warning = formatInspectWarning(summarizeErrors(inspectResult.errors));
             }
         } catch (e) {
+            if (signal?.aborted || isAbortError(e))
+                throw e;
             warning = formatInspectWarning(e?.message || String(e));
             console.warn("app-health: docker inspect failed", e);
         }
     }
+
+    throwIfAborted(signal);
 
     const survivingCandidates = vanishedIds.size > 0
         ? candidates.filter(c => !vanishedIds.has(c.id) && !vanishedIds.has(normalizeContainerId(c.id)))
@@ -757,7 +981,7 @@ export async function loadContainers(filter, options = {}) {
     const runningIds = filtered.filter(isContainerRunning).map(c => c.id).filter(Boolean);
     if (runningIds.length > 0) {
         try {
-            const statsResult = await dockerStatsForIds(runningIds, spawn, { concurrency });
+            const statsResult = await dockerStatsForIds(runningIds, spawn, { concurrency, signal });
             const byId = statsByContainerId(statsResult.rows);
             for (const c of filtered) {
                 const st = lookupStats(byId, c);
@@ -771,11 +995,15 @@ export async function loadContainers(filter, options = {}) {
                 warning = warning ? `${warning} ${statsWarning}` : statsWarning;
             }
         } catch (e) {
+            if (signal?.aborted || isAbortError(e))
+                throw e;
             const statsWarning = formatStatsWarning(e?.message || String(e));
             warning = warning ? `${warning} ${statsWarning}` : statsWarning;
             console.warn("app-health: docker stats failed", e);
         }
     }
+
+    throwIfAborted(signal);
 
     filtered.sort((a, b) => a.name.localeCompare(b.name));
     return { containers: filtered, warning };
@@ -791,29 +1019,43 @@ export function formatWarningTimestamp(now = new Date()) {
     const hh = String(d.getHours()).padStart(2, "0");
     const mm = String(d.getMinutes()).padStart(2, "0");
     const ss = String(d.getSeconds()).padStart(2, "0");
-    return `${yyyy}-${mo}-${dd} ${hh}:${mm}:${ss}`;
+    const offsetMinutes = -d.getTimezoneOffset();
+    const sign = offsetMinutes >= 0 ? "+" : "-";
+    const absOffset = Math.abs(offsetMinutes);
+    const tzHours = String(Math.floor(absOffset / 60)).padStart(2, "0");
+    const tzMinutes = String(absOffset % 60).padStart(2, "0");
+    return `${yyyy}-${mo}-${dd} ${hh}:${mm}:${ss} ${sign}${tzHours}:${tzMinutes}`;
 }
 
 export function formatWarningWithMeta(message, timestamp, consecutiveFailures = 0) {
     if (consecutiveFailures > 0)
-        return `[${timestamp}, consecutive failures: ${consecutiveFailures}] ${message}`;
-    return `[${timestamp}] ${message}`;
+        return formatMsg(_("[$0, consecutive failures: $1] $2"), timestamp, consecutiveFailures, message);
+    return formatMsg(_("[$0] $1"), timestamp, message);
 }
 
-function runWithTimeout(fn, timeoutMs) {
+function runWithTimeout(fn, timeoutMs, { abortController, formatTimeoutError = defaultRefreshTimeoutMessage } = {}) {
+    const signal = abortController?.signal;
     if (!timeoutMs || timeoutMs <= 0)
-        return Promise.resolve().then(fn);
+        return Promise.resolve().then(() => fn({ signal }));
     return new Promise((resolve, reject) => {
         let settled = false;
         const timer = setTimeout(() => {
             if (settled)
                 return;
             settled = true;
-            reject(new Error(`Refresh timed out after ${timeoutMs}ms`));
+            const err = new Error(formatTimeoutError(timeoutMs));
+            err.code = "REFRESH_TIMEOUT";
+            err.timeoutMs = timeoutMs;
+            try {
+                abortController?.abort(createAbortError(err.message));
+            } catch (e) {
+                // ignore abort errors
+            }
+            reject(err);
         }, timeoutMs);
 
         Promise.resolve()
-                .then(fn)
+                .then(() => fn({ signal }))
                 .then(
                     val => {
                         if (settled)
@@ -835,20 +1077,25 @@ function runWithTimeout(fn, timeoutMs) {
 
 /**
  * Coordinate manual and background refreshes so that:
- * - Background refreshes are skipped while any refresh is in flight (`inFlightCount > 0`),
+ * - Background refreshes are skipped while the current refresh round is in flight,
  *   and do not flip `loading` to `true` (avoiding UI button flicker every 8s).
- * - Manual refreshes (`background: false`) always preempt any in-flight refresh via `generation`.
- * - Each refresh round is bounded by `timeoutMs` so a hung daemon never blocks future refreshes forever.
- * - `consecutiveFailures` only counts failed refresh rounds (thrown errors), not partial warnings.
+ * - Manual refreshes (`background: false`) always preempt any in-flight refresh via `generation`
+ *   and abort its `AbortSignal` so superseded `docker` processes are terminated.
+ * - Each refresh round is bounded by `timeoutMs` and aborts its `AbortSignal` on timeout so
+ *   hung `docker` tasks do not keep queuing in the background across rounds.
+ * - `consecutiveFailures` only counts failed refresh rounds (thrown errors), not partial warnings,
+ *   and both manual `error` and background `warning` include timestamp + failure count.
  */
 export function createRefreshController({
     load,
     onStateChange,
     now = () => new Date(),
     formatWarningMeta = formatWarningWithMeta,
+    formatTimeoutError = defaultRefreshTimeoutMessage,
     timeoutMs = DEFAULT_REFRESH_TIMEOUT_MS,
 }) {
-    let inFlightCount = 0;
+    let activeRoundInFlight = false;
+    let activeAbortController = null;
     let generation = 0;
     let consecutiveFailures = 0;
     let lastWarningAt = null;
@@ -857,13 +1104,12 @@ export function createRefreshController({
         error: null,
         warning: null,
         loading: true,
-        inFlightCount: 0,
         consecutiveFailures: 0,
         lastWarningAt: null,
     };
 
     const emit = patch => {
-        state = { ...state, ...patch, inFlightCount, consecutiveFailures, lastWarningAt };
+        state = { ...state, ...patch, consecutiveFailures, lastWarningAt };
         if (onStateChange)
             onStateChange(state);
         return state;
@@ -872,21 +1118,32 @@ export function createRefreshController({
     async function refresh(options = {}) {
         const background = options.background === true;
 
-        if (background && inFlightCount > 0)
+        if (background && activeRoundInFlight)
             return false;
 
-        inFlightCount += 1;
+        if (activeAbortController) {
+            try {
+                activeAbortController.abort(createAbortError("Preempted by manual refresh"));
+            } catch (e) {
+                // ignore abort errors
+            }
+        }
+
+        const abortController = typeof AbortController === "function" ? new AbortController() : null;
+        activeAbortController = abortController;
+        activeRoundInFlight = true;
         const gen = ++generation;
 
-        if (!background) {
+        if (!background)
             emit({ loading: true, error: null, warning: null });
-        } else {
-            state = { ...state, inFlightCount };
-        }
 
         let completionPatch = {};
         try {
-            const result = await runWithTimeout(load, timeoutMs);
+            const result = await runWithTimeout(
+                ({ signal }) => load({ signal, background }),
+                timeoutMs,
+                { abortController, formatTimeoutError }
+            );
             if (gen === generation) {
                 consecutiveFailures = 0;
                 if (result.warning) {
@@ -911,27 +1168,27 @@ export function createRefreshController({
                 const message = e?.message || String(e);
                 consecutiveFailures += 1;
                 lastWarningAt = formatWarningTimestamp(now());
+                const formatted = formatWarningMeta(message, lastWarningAt, consecutiveFailures);
 
                 if (background) {
-                    const formatted = formatWarningMeta(message, lastWarningAt, consecutiveFailures);
                     completionPatch = { warning: formatted };
                 } else {
                     completionPatch = {
                         containers: [],
-                        error: message,
+                        error: formatted,
                         warning: null,
                     };
                 }
             }
         } finally {
-            inFlightCount = Math.max(0, inFlightCount - 1);
+            if (activeAbortController === abortController)
+                activeAbortController = null;
             if (gen === generation) {
+                activeRoundInFlight = false;
                 emit({
                     ...completionPatch,
                     loading: false,
                 });
-            } else {
-                emit({});
             }
         }
         return true;
@@ -942,4 +1199,5 @@ export function createRefreshController({
         getState: () => state,
     };
 }
+
 

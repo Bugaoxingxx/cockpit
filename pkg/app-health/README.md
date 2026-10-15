@@ -61,16 +61,17 @@ you configure filters.
 | List containers via `docker ps -a --format` | Done |
 | Filter by manifest `name-prefixes` / `label-selectors` | Done |
 | Name, image, status, ports | Done |
-| Restart count via batched `docker inspect` on **candidates only** (50 IDs/call) | Done |
-| CPU / memory via batched `docker stats` on **filtered running** IDs | Done |
-| Manual refresh + auto-refresh every 8s (skips overlap, keeps list on background errors) | Done |
+| Restart count via concurrent batched `docker inspect` on **candidates only** (50 IDs/call, per-ID fallback on batch failure) | Done |
+| CPU / memory via concurrent batched `docker stats` on **filtered running** IDs (per-ID retry when a container disappears mid-refresh) | Done |
+| Manual refresh + auto-refresh every 8s (counter-based single-round guard, warning timestamp + consecutive failure count) | Done |
 | Container detail view | **Stub** (placeholder page) |
 | Start / stop / restart actions | **Not implemented** |
 | Live streaming stats | **Not implemented** |
 
 ## Tests
 
-Unit tests for filter/stats helpers live in `pkg/app-health/test-app-health-lib.js`
+Unit tests for filter matching, selector validation, data loading (with mock `spawn`),
+and refresh concurrency/warning metadata live in `pkg/app-health/test-app-health-lib.js`
 and run with the repo QUnit harness (`./build.js` then open `qunit/` in a
 browser, or the full Cockpit `make check` flow). There is no browser integration
 test for this package yet.

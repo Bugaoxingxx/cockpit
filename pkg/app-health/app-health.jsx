@@ -7,7 +7,7 @@ import '../lib/patternfly/patternfly-6-cockpit.scss';
 import "polyfills";
 import 'cockpit-dark-theme'; // once per page
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from 'react-dom/client';
 import { Alert } from "@patternfly/react-core/dist/esm/components/Alert/index.js";
 import { Button } from "@patternfly/react-core/dist/esm/components/Button/index.js";
@@ -27,22 +27,10 @@ import cockpit from "cockpit";
 import {
     activeLabelSelectors,
     activeNamePrefixes,
-    applyInspectMetadata,
-    chunkArray,
-    containerMatchesFilter,
-    containersVisibleWithoutInspect,
+    createRefreshController,
     DEFAULT_LABEL_SELECTORS,
-    INSPECT_BATCH_SIZE,
-    isContainerRunning,
-    labelSelectorToDockerFilter,
     LIST_REFRESH_MS,
-    lookupStats,
-    mergeContainersById,
-    nameMatches,
-    normalizeName,
-    parseJsonLines,
-    STATS_BATCH_SIZE,
-    statsByContainerId,
+    loadContainers,
 } from './app-health-lib.js';
 
 import './app-health.scss';
@@ -60,13 +48,11 @@ function dockerSpawn(args, options = {}) {
 function readFilterConfig() {
     const config = cockpit.manifests?.["app-health"]?.config || {};
     const namePrefixes = config["name-prefixes"] ?? config.namePrefixes ?? [];
-    const labelSelectors = config["label-selectors"] ?? config.labelSelectors;
+    const labelSelectors = config["label-selectors"] ?? config.labelSelectors ?? DEFAULT_LABEL_SELECTORS;
 
     return {
-        namePrefixes: Array.isArray(namePrefixes) ? namePrefixes : [],
-        labelSelectors: Array.isArray(labelSelectors)
-            ? labelSelectors
-            : DEFAULT_LABEL_SELECTORS,
+        namePrefixes: activeNamePrefixes({ namePrefixes }),
+        labelSelectors: activeLabelSelectors({ labelSelectors }),
     };
 }
 
@@ -92,168 +78,6 @@ function labelColor(status, state) {
     return "grey";
 }
 
-function psRowToContainer(row) {
-    const id = row.ID || row.Id || "";
-    const name = normalizeName(
-        (row.Names || row.Name || "").split(",")[0] || id.slice(0, 12)
-    );
-    return {
-        id,
-        name,
-        image: row.Image || "",
-        status: row.Status || "",
-        state: row.State || "",
-        ports: row.Ports || "",
-        created: row.CreatedAt || row.RunningFor || "",
-        labels: {},
-        labelFilterMatched: false,
-        restartCount: null,
-        cpu: null,
-        memory: null,
-    };
-}
-
-async function dockerInspectAll(ids) {
-    const inspected = [];
-    for (const batch of chunkArray(ids, INSPECT_BATCH_SIZE)) {
-        const inspectOut = await dockerSpawn([
-            "inspect",
-            "--format", "{{json .}}",
-            ...batch,
-        ]);
-        inspected.push(...parseJsonLines(inspectOut));
-    }
-    return inspected;
-}
-
-async function dockerStatsForIds(ids) {
-    const rows = [];
-    for (const batch of chunkArray(ids, STATS_BATCH_SIZE)) {
-        const statsOut = await dockerSpawn([
-            "stats", "--no-stream", "--format", "{{json .}}",
-            ...batch,
-        ]);
-        rows.push(...parseJsonLines(statsOut));
-    }
-    return rows;
-}
-
-async function fetchAllPsContainers() {
-    const psOut = await dockerSpawn([
-        "ps", "-a",
-        "--format", "{{json .}}",
-    ]);
-    return parseJsonLines(psOut).map(psRowToContainer);
-}
-
-async function fetchPsWithLabelSelector(selector) {
-    const dockerFilter = labelSelectorToDockerFilter(selector);
-    if (!dockerFilter)
-        return [];
-    const psOut = await dockerSpawn([
-        "ps", "-a",
-        "--filter", dockerFilter,
-        "--format", "{{json .}}",
-    ]);
-    return parseJsonLines(psOut).map(row => {
-        const c = psRowToContainer(row);
-        c.labelFilterMatched = true;
-        return c;
-    });
-}
-
-/**
- * Build candidate containers without inspecting the whole host: label rules use
- * `docker ps --filter`, name rules filter the ps list in memory, union when both.
- */
-async function gatherCandidates(filter) {
-    const namePrefixes = activeNamePrefixes(filter);
-    const labelSelectors = activeLabelSelectors(filter);
-
-    if (namePrefixes.length === 0 && labelSelectors.length === 0)
-        return [];
-
-    let candidates = [];
-
-    for (const sel of labelSelectors)
-        candidates = mergeContainersById(candidates, await fetchPsWithLabelSelector(sel));
-
-    if (namePrefixes.length > 0) {
-        const all = await fetchAllPsContainers();
-        const byName = all.filter(c => nameMatches(c.name, namePrefixes));
-        candidates = mergeContainersById(candidates, byName);
-    }
-
-    return candidates;
-}
-
-/**
- * Load container list + restart counts + one-shot stats for filtered apps only.
- * Detail view is intentionally stubbed (see ContainerDetailStub).
- */
-async function loadContainers(filter) {
-    let warning = null;
-    const candidates = await gatherCandidates(filter);
-
-    if (candidates.length === 0)
-        return { containers: [], warning: null };
-
-    const inspectIds = candidates.map(c => c.id).filter(Boolean);
-    let inspectFailed = false;
-
-    try {
-        const inspected = await dockerInspectAll(inspectIds);
-        applyInspectMetadata(candidates, inspected);
-    } catch (e) {
-        inspectFailed = true;
-        warning = cockpit.format(
-            _("Could not inspect containers (restart counts and labels may be incomplete): $0"),
-            e.message || String(e)
-        );
-        console.warn("app-health: docker inspect failed", e);
-    }
-
-    let filtered = candidates.filter(c => containerMatchesFilter(c, filter));
-
-    if (inspectFailed && filtered.length === 0 && candidates.length > 0) {
-        filtered = containersVisibleWithoutInspect(candidates, filter);
-        if (filtered.length > 0) {
-            warning = (warning ? warning + " " : "") +
-                _("Showing containers matched by name or label filter; inspect metadata is unavailable.");
-        } else {
-            throw new Error(
-                warning ||
-                _("Could not inspect containers and no applications matched without inspect metadata.")
-            );
-        }
-    }
-
-    const runningIds = filtered.filter(isContainerRunning).map(c => c.id).filter(Boolean);
-    if (runningIds.length > 0) {
-        try {
-            const statsRows = await dockerStatsForIds(runningIds);
-            const byId = statsByContainerId(statsRows);
-            for (const c of filtered) {
-                const st = lookupStats(byId, c);
-                if (st) {
-                    c.cpu = st.cpu;
-                    c.memory = st.memory;
-                }
-            }
-        } catch (e) {
-            const statsWarning = cockpit.format(
-                _("Could not read container stats (CPU/memory unavailable): $0"),
-                e.message || String(e)
-            );
-            warning = warning ? `${warning} ${statsWarning}` : statsWarning;
-            console.warn("app-health: docker stats failed", e);
-        }
-    }
-
-    filtered.sort((a, b) => a.name.localeCompare(b.name));
-    return { containers: filtered, warning };
-}
-
 const ContainerDetailStub = ({ name }) => (
     <PageSection hasBodyWrapper={false} padding={{ default: "padding" }}>
         <Card>
@@ -275,51 +99,39 @@ const ContainerDetailStub = ({ name }) => (
 );
 
 const ContainerList = () => {
-    const [containers, setContainers] = useState(null);
-    const [error, setError] = useState(null);
-    const [warning, setWarning] = useState(null);
-    const [loading, setLoading] = useState(true);
     const filter = useMemo(() => readFilterConfig(), []);
-    const refreshGenRef = useRef(0);
-    const inFlightRef = useRef(false);
+    const [refreshState, setRefreshState] = useState({
+        containers: null,
+        error: null,
+        warning: null,
+        loading: true,
+        inFlightCount: 0,
+        consecutiveFailures: 0,
+        lastWarningAt: null,
+    });
 
-    const refresh = useCallback(async (options = {}) => {
-        const background = options.background === true;
-        if (background && inFlightRef.current)
-            return;
+    const controller = useMemo(() => createRefreshController({
+        load: () => loadContainers(filter, {
+            spawn: dockerSpawn,
+            formatInspectWarning: msg => cockpit.format(
+                _("Could not inspect containers (restart counts and labels may be incomplete): $0"),
+                msg
+            ),
+            formatStatsWarning: msg => cockpit.format(
+                _("Could not read container stats (CPU/memory unavailable): $0"),
+                msg
+            ),
+        }),
+        formatWarningMeta: (msg, time, count) => cockpit.format(
+            _("[$0, consecutive failures: $1] $2"),
+            time,
+            count,
+            msg
+        ),
+        onStateChange: setRefreshState,
+    }), [filter]);
 
-        const gen = ++refreshGenRef.current;
-        inFlightRef.current = true;
-
-        if (!background) {
-            setLoading(true);
-            setError(null);
-            setWarning(null);
-        }
-        try {
-            const result = await loadContainers(filter);
-            if (gen !== refreshGenRef.current)
-                return;
-            setContainers(result.containers);
-            setError(null);
-            setWarning(result.warning);
-        } catch (e) {
-            if (gen !== refreshGenRef.current)
-                return;
-            const message = e.message || String(e);
-            if (background) {
-                setWarning(message);
-            } else {
-                setContainers([]);
-                setError(message);
-            }
-        } finally {
-            if (gen === refreshGenRef.current)
-                inFlightRef.current = false;
-            if (!background && gen === refreshGenRef.current)
-                setLoading(false);
-        }
-    }, [filter]);
+    const refresh = useCallback((options = {}) => controller.refresh(options), [controller]);
 
     useInit(() => { refresh() });
 
@@ -327,6 +139,9 @@ const ContainerList = () => {
         const timer = window.setInterval(() => refresh({ background: true }), LIST_REFRESH_MS);
         return () => window.clearInterval(timer);
     }, [refresh]);
+
+    const { containers, error, warning, loading, inFlightCount } = refreshState;
+    const isBusy = loading || inFlightCount > 0;
 
     const columns = [
         { title: _("Name") },
@@ -375,7 +190,7 @@ const ContainerList = () => {
                 <p className="app-health-hint">
                     {_("Ensure the Docker CLI is installed and the logged-in user can run docker (e.g. membership in the docker group).")}
                 </p>
-                <Button variant="secondary" onClick={() => refresh()}>{_("Retry")}</Button>
+                <Button variant="secondary" isDisabled={isBusy} onClick={() => refresh()}>{_("Retry")}</Button>
             </Alert>
         );
     } else {
@@ -402,8 +217,8 @@ const ContainerList = () => {
                 <CardHeader actions={{
                     actions: (
                         <Button variant="secondary"
-                                icon={loading ? <Spinner size="md" /> : <SyncAltIcon />}
-                                isDisabled={loading}
+                                icon={isBusy ? <Spinner size="md" /> : <SyncAltIcon />}
+                                isDisabled={isBusy}
                                 onClick={() => refresh()}>
                             {_("Refresh")}
                         </Button>

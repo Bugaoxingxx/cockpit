@@ -6,6 +6,9 @@
 export const DEFAULT_LABEL_SELECTORS = ["cockpit.app-health=true"];
 export const INSPECT_BATCH_SIZE = 50;
 export const STATS_BATCH_SIZE = 50;
+export const MAX_CONCURRENT_SPAWNS = 4;
+export const DEFAULT_SPAWN_TIMEOUT_MS = 15000;
+export const DEFAULT_REFRESH_TIMEOUT_MS = 30000;
 export const LIST_REFRESH_MS = 8000;
 
 /** Parse NDJSON (one JSON object per line) from docker --format '{{json .}}'. */
@@ -44,6 +47,119 @@ export function chunkArray(items, size) {
     for (let i = 0; i < items.length; i += size)
         chunks.push(items.slice(i, i + size));
     return chunks;
+}
+
+/**
+ * Create a concurrency limiter (semaphore) that runs at most `limit` async functions at once.
+ */
+export function createConcurrencyLimiter(limit = MAX_CONCURRENT_SPAWNS) {
+    const max = Math.max(1, Number(limit) || MAX_CONCURRENT_SPAWNS);
+    let active = 0;
+    const queue = [];
+
+    const next = () => {
+        while (active < max && queue.length > 0) {
+            active += 1;
+            const { fn, resolve, reject } = queue.shift();
+            Promise.resolve()
+                    .then(fn)
+                    .then(resolve, reject)
+                    .finally(() => {
+                        active -= 1;
+                        next();
+                    });
+        }
+    };
+
+    return fn => new Promise((resolve, reject) => {
+        queue.push({ fn, resolve, reject });
+        next();
+    });
+}
+
+/**
+ * Map `items` with at most `concurrency` workers active in parallel.
+ */
+export async function mapWithConcurrency(items, concurrency, mapper) {
+    const list = Array.from(items || []);
+    if (list.length === 0)
+        return [];
+    const limit = Math.max(1, Math.min(Number(concurrency) || MAX_CONCURRENT_SPAWNS, list.length));
+    const results = new Array(list.length);
+    let nextIndex = 0;
+
+    const worker = async () => {
+        while (nextIndex < list.length) {
+            const idx = nextIndex++;
+            results[idx] = await mapper(list[idx], idx);
+        }
+    };
+
+    await Promise.all(Array.from({ length: limit }, () => worker()));
+    return results;
+}
+
+/**
+ * Wrap a `spawn(args, options)` function with a timeout so hung `docker` CLI processes
+ * are terminated (`proc.close("terminated")`) and rejected instead of blocking forever.
+ */
+export function withSpawnTimeout(spawn, timeoutMs = DEFAULT_SPAWN_TIMEOUT_MS) {
+    if (!timeoutMs || timeoutMs <= 0)
+        return spawn;
+    return (args, options) => new Promise((resolve, reject) => {
+        let settled = false;
+        let proc;
+        const timer = setTimeout(() => {
+            if (settled)
+                return;
+            settled = true;
+            try {
+                proc?.close?.("terminated");
+            } catch (e) {
+                // ignore close errors on timed-out process
+            }
+            const subcmd = Array.isArray(args) && args[0] ? `docker ${args[0]}` : "docker command";
+            reject(new Error(`${subcmd} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+
+        try {
+            proc = spawn(args, options);
+        } catch (err) {
+            clearTimeout(timer);
+            reject(err);
+            return;
+        }
+
+        Promise.resolve(proc).then(
+            val => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(val);
+            },
+            err => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                reject(err);
+            }
+        );
+    });
+}
+
+export function summarizeErrors(errors) {
+    const msgs = [];
+    const seen = new Set();
+    for (const err of errors || []) {
+        const msg = (err?.message || String(err || "")).trim();
+        if (msg && !seen.has(msg)) {
+            seen.add(msg);
+            msgs.push(msg);
+        }
+    }
+    return msgs.join("; ");
 }
 
 export function isValidLabelKey(key) {
@@ -130,6 +246,89 @@ export function activeLabelSelectors(filter) {
     return out;
 }
 
+const DEFAULT_CONFIG_MESSAGES = {
+    invalidNamePrefixesType: () => "name-prefixes must be an array of non-empty strings",
+    invalidNamePrefixEntry: entry => `ignored invalid name-prefixes entry: ${entry}`,
+    invalidLabelSelectorsType: fallback =>
+        `label-selectors must be an array; falling back to default (${fallback})`,
+    invalidLabelSelectorEntry: entry => `ignored invalid label-selectors entry: ${entry}`,
+    noActiveFilterRules: () =>
+        "no effective filter rules are active (both name-prefixes and label-selectors are empty); no containers will match",
+};
+
+/**
+ * Validate raw manifest `config` (`name-prefixes` / `label-selectors`) and return normalized
+ * filter arrays along with user-visible `configIssues` / `configWarning`.
+ * When `label-selectors` is not an array (e.g. misconfigured as a string or number),
+ * falls back to `defaultLabelSelectors` instead of silently showing an empty list.
+ * When both effective `namePrefixes` and `labelSelectors` end up empty, records a warning
+ * so the user knows why no containers can match.
+ */
+export function resolveFilterConfig(
+    rawConfig = {},
+    defaultLabelSelectors = DEFAULT_LABEL_SELECTORS,
+    messages = {}
+) {
+    const fmt = { ...DEFAULT_CONFIG_MESSAGES, ...messages };
+    const cfg = rawConfig && typeof rawConfig === "object" ? rawConfig : {};
+    const rawPrefixes = cfg["name-prefixes"] ?? cfg.namePrefixes;
+    const rawSelectors = cfg["label-selectors"] ?? cfg.labelSelectors;
+    const configIssues = [];
+
+    const namePrefixes = [];
+    if (rawPrefixes !== undefined && rawPrefixes !== null) {
+        if (!Array.isArray(rawPrefixes)) {
+            console.warn("app-health: ignoring invalid name-prefixes (expected array)", rawPrefixes);
+            configIssues.push(fmt.invalidNamePrefixesType());
+        } else {
+            for (const p of rawPrefixes) {
+                if (typeof p !== "string" || !p.trim()) {
+                    console.warn("app-health: ignoring invalid name prefix", p);
+                    configIssues.push(fmt.invalidNamePrefixEntry(JSON.stringify(p)));
+                    continue;
+                }
+                namePrefixes.push(p.trim());
+            }
+        }
+    }
+
+    let labelSelectors = [];
+    if (rawSelectors === undefined || rawSelectors === null) {
+        labelSelectors = activeLabelSelectors({ labelSelectors: defaultLabelSelectors });
+    } else if (!Array.isArray(rawSelectors)) {
+        console.warn("app-health: ignoring invalid label-selectors (expected array), falling back to default", rawSelectors);
+        labelSelectors = activeLabelSelectors({ labelSelectors: defaultLabelSelectors });
+        configIssues.push(fmt.invalidLabelSelectorsType(labelSelectors.join(", ")));
+    } else {
+        for (const s of rawSelectors) {
+            if (typeof s !== "string" || !s.trim()) {
+                console.warn("app-health: ignoring invalid label selector", s);
+                configIssues.push(fmt.invalidLabelSelectorEntry(JSON.stringify(s)));
+                continue;
+            }
+            const { key, value } = parseLabelSelector(s.trim());
+            if (!isValidLabelKey(key)) {
+                console.warn("app-health: ignoring invalid label selector", s);
+                configIssues.push(fmt.invalidLabelSelectorEntry(JSON.stringify(s)));
+                continue;
+            }
+            labelSelectors.push(value === null || value === "" ? key : `${key}=${value}`);
+        }
+    }
+
+    if (namePrefixes.length === 0 && labelSelectors.length === 0) {
+        console.warn("app-health: no effective filter rules are active");
+        configIssues.push(fmt.noActiveFilterRules());
+    }
+
+    return {
+        namePrefixes,
+        labelSelectors,
+        configIssues,
+        configWarning: configIssues.length > 0 ? configIssues.join("; ") : null,
+    };
+}
+
 export function filterNeedsLabels(filter) {
     return activeLabelSelectors(filter).length > 0;
 }
@@ -186,7 +385,9 @@ export function nameMatches(name, prefixes) {
 /**
  * Decide whether a container belongs in the company app list.
  * When both prefix and label rules are configured, either match is enough.
- * When neither is configured, nothing is listed (configure manifest config).
+ * When `container.inspected` is true, `container.labels` from `docker inspect` is authoritative
+ * for label matching; `container.labelFilterMatched` is only used as a fallback when inspect
+ * metadata is unavailable (`!container.inspected`).
  */
 export function containerMatchesFilter(container, filter) {
     const namePrefixes = activeNamePrefixes(filter);
@@ -197,12 +398,11 @@ export function containerMatchesFilter(container, filter) {
     if (!hasPrefixRule && !hasLabelRule)
         return false;
 
-    if (container.labelFilterMatched && hasLabelRule)
-        return true;
-
     if (hasPrefixRule && nameMatches(container.name, namePrefixes))
         return true;
     if (hasLabelRule && labelsMatch(container.labels, labelSelectors))
+        return true;
+    if (!container.inspected && container.labelFilterMatched && hasLabelRule)
         return true;
     return false;
 }
@@ -238,6 +438,7 @@ export function psRowToContainer(row) {
         ports: row.Ports || "",
         created: row.CreatedAt || row.RunningFor || "",
         labels: {},
+        inspected: false,
         labelFilterMatched: false,
         restartCount: null,
         cpu: null,
@@ -246,8 +447,9 @@ export function psRowToContainer(row) {
 }
 
 export function applyInspectMetadata(containers, inspected) {
+    const rows = Array.isArray(inspected) ? inspected : (inspected?.rows || []);
     const byId = {};
-    for (const info of inspected) {
+    for (const info of rows) {
         const fullId = info.Id || "";
         const id = normalizeContainerId(fullId);
         const name = normalizeName(info.Name || "");
@@ -264,6 +466,7 @@ export function applyInspectMetadata(containers, inspected) {
             continue;
         c.restartCount = meta.restartCount;
         c.labels = meta.labels;
+        c.inspected = true;
         if (meta.state)
             c.state = meta.state;
         if (meta.name)
@@ -278,8 +481,9 @@ export function isContainerRunning(container) {
 
 /** Index docker stats rows by short container ID, with name as fallback. */
 export function statsByContainerId(statsRows) {
+    const rows = Array.isArray(statsRows) ? statsRows : (statsRows?.rows || []);
     const byId = {};
-    for (const s of statsRows) {
+    for (const s of rows) {
         const entry = {
             cpu: s.CPUPerc || s.CPUPercentage || null,
             memory: s.MemUsage || s.MemoryUsage || null,
@@ -309,18 +513,21 @@ export function isNoSuchContainerError(err) {
 }
 
 /**
- * Inspect candidate container IDs in concurrent batches of `INSPECT_BATCH_SIZE`.
+ * Inspect candidate container IDs in batches of `INSPECT_BATCH_SIZE` with bounded concurrency.
  * If a multi-ID batch fails (e.g. a container vanished mid-refresh), retries each ID
- * individually so surviving containers still receive inspect metadata.
- * Containers that disappeared (`No such object` / `No such container`) are recorded
- * on `inspected.vanishedIds` without raising warnings.
+ * individually (also bounded by `concurrency`) so surviving containers still receive inspect metadata.
+ * Returns `{ rows, errors, vanishedIds }`.
  */
-export async function dockerInspectAll(ids, spawn) {
+export async function dockerInspectAll(ids, spawn, options = {}) {
+    const concurrency = options.concurrency || MAX_CONCURRENT_SPAWNS;
+    const runLimited = createConcurrencyLimiter(concurrency);
+    const limitedSpawn = args => runLimited(() => spawn(args));
+
     const cleanIds = [...new Set((ids || []).filter(Boolean))];
     const batches = chunkArray(cleanIds, INSPECT_BATCH_SIZE);
-    const batchResults = await Promise.all(batches.map(async batch => {
+    const batchResults = await mapWithConcurrency(batches, concurrency, async batch => {
         try {
-            const inspectOut = await spawn([
+            const inspectOut = await limitedSpawn([
                 "inspect",
                 "--format", "{{json .}}",
                 ...batch,
@@ -335,9 +542,9 @@ export async function dockerInspectAll(ids, spawn) {
             const rows = [];
             const errors = [];
             const vanishedIds = [];
-            await Promise.all(batch.map(async id => {
+            await mapWithConcurrency(batch, concurrency, async id => {
                 try {
-                    const out = await spawn([
+                    const out = await limitedSpawn([
                         "inspect",
                         "--format", "{{json .}}",
                         id,
@@ -349,71 +556,10 @@ export async function dockerInspectAll(ids, spawn) {
                     else
                         errors.push(retryErr);
                 }
-            }));
+            });
             return { rows, errors, vanishedIds };
         }
-    }));
-
-    const inspected = [];
-    const errors = [];
-    const vanishedIds = new Set();
-    for (const res of batchResults) {
-        inspected.push(...res.rows);
-        errors.push(...res.errors);
-        for (const id of res.vanishedIds) {
-            vanishedIds.add(id);
-            vanishedIds.add(normalizeContainerId(id));
-        }
-    }
-    if (inspected.length === 0 && errors.length > 0)
-        throw errors[0];
-    inspected.errors = errors;
-    inspected.vanishedIds = vanishedIds;
-    return inspected;
-}
-
-/**
- * Read one-shot `docker stats --no-stream` for `ids` in concurrent batches of `STATS_BATCH_SIZE`.
- * When a batch fails (e.g. one container was removed during a rolling update), retries each ID
- * in that batch individually so other containers in the batch still get CPU/memory stats.
- * Containers that disappeared (`No such container`) are ignored without raising warnings.
- */
-export async function dockerStatsForIds(ids, spawn) {
-    const cleanIds = [...new Set((ids || []).filter(Boolean))];
-    const batches = chunkArray(cleanIds, STATS_BATCH_SIZE);
-    const batchResults = await Promise.all(batches.map(async batch => {
-        try {
-            const statsOut = await spawn([
-                "stats", "--no-stream", "--format", "{{json .}}",
-                ...batch,
-            ]);
-            return { rows: parseJsonLines(statsOut), errors: [], vanishedIds: [] };
-        } catch (err) {
-            if (batch.length <= 1) {
-                if (isNoSuchContainerError(err))
-                    return { rows: [], errors: [], vanishedIds: [...batch] };
-                return { rows: [], errors: [err], vanishedIds: [] };
-            }
-            const rows = [];
-            const errors = [];
-            const vanishedIds = [];
-            await Promise.all(batch.map(async id => {
-                try {
-                    const singleOut = await spawn([
-                        "stats", "--no-stream", "--format", "{{json .}}",
-                        id,
-                    ]);
-                    rows.push(...parseJsonLines(singleOut));
-                } catch (retryErr) {
-                    if (isNoSuchContainerError(retryErr))
-                        vanishedIds.push(id);
-                    else
-                        errors.push(retryErr);
-                }
-            }));
-            return { rows, errors, vanishedIds };
-        }
-    }));
+    });
 
     const rows = [];
     const errors = [];
@@ -427,10 +573,72 @@ export async function dockerStatsForIds(ids, spawn) {
         }
     }
     if (rows.length === 0 && errors.length > 0)
-        throw errors[0];
-    rows.errors = errors;
-    rows.vanishedIds = vanishedIds;
-    return rows;
+        throw new Error(summarizeErrors(errors));
+    return { rows, errors, vanishedIds };
+}
+
+/**
+ * Read one-shot `docker stats --no-stream` for `ids` in batches of `STATS_BATCH_SIZE`
+ * with bounded concurrency.
+ * When a batch fails (e.g. one container was removed during a rolling update), retries each ID
+ * in that batch individually (bounded by `concurrency`) so other containers still get stats.
+ * Returns `{ rows, errors, vanishedIds }`.
+ */
+export async function dockerStatsForIds(ids, spawn, options = {}) {
+    const concurrency = options.concurrency || MAX_CONCURRENT_SPAWNS;
+    const runLimited = createConcurrencyLimiter(concurrency);
+    const limitedSpawn = args => runLimited(() => spawn(args));
+
+    const cleanIds = [...new Set((ids || []).filter(Boolean))];
+    const batches = chunkArray(cleanIds, STATS_BATCH_SIZE);
+    const batchResults = await mapWithConcurrency(batches, concurrency, async batch => {
+        try {
+            const statsOut = await limitedSpawn([
+                "stats", "--no-stream", "--format", "{{json .}}",
+                ...batch,
+            ]);
+            return { rows: parseJsonLines(statsOut), errors: [], vanishedIds: [] };
+        } catch (err) {
+            if (batch.length <= 1) {
+                if (isNoSuchContainerError(err))
+                    return { rows: [], errors: [], vanishedIds: [...batch] };
+                return { rows: [], errors: [err], vanishedIds: [] };
+            }
+            const rows = [];
+            const errors = [];
+            const vanishedIds = [];
+            await mapWithConcurrency(batch, concurrency, async id => {
+                try {
+                    const singleOut = await limitedSpawn([
+                        "stats", "--no-stream", "--format", "{{json .}}",
+                        id,
+                    ]);
+                    rows.push(...parseJsonLines(singleOut));
+                } catch (retryErr) {
+                    if (isNoSuchContainerError(retryErr))
+                        vanishedIds.push(id);
+                    else
+                        errors.push(retryErr);
+                }
+            });
+            return { rows, errors, vanishedIds };
+        }
+    });
+
+    const rows = [];
+    const errors = [];
+    const vanishedIds = new Set();
+    for (const res of batchResults) {
+        rows.push(...res.rows);
+        errors.push(...res.errors);
+        for (const id of res.vanishedIds) {
+            vanishedIds.add(id);
+            vanishedIds.add(normalizeContainerId(id));
+        }
+    }
+    if (rows.length === 0 && errors.length > 0)
+        throw new Error(summarizeErrors(errors));
+    return { rows, errors, vanishedIds };
 }
 
 export async function fetchAllPsContainers(spawn) {
@@ -459,26 +667,27 @@ export async function fetchPsWithLabelSelector(selector, spawn) {
 
 /**
  * Build candidate containers without inspecting the whole host: label rules use
- * `docker ps --filter` concurrently across unique selectors, name rules filter
+ * `docker ps --filter` with bounded concurrency across unique selectors, name rules filter
  * the ps list in memory, union when both.
  */
-export async function gatherCandidates(filter, spawn) {
+export async function gatherCandidates(filter, spawn, options = {}) {
+    const concurrency = options.concurrency || MAX_CONCURRENT_SPAWNS;
     const namePrefixes = activeNamePrefixes(filter);
     const labelSelectors = [...new Set(activeLabelSelectors(filter))];
 
     if (namePrefixes.length === 0 && labelSelectors.length === 0)
         return [];
 
-    const tasks = labelSelectors.map(sel => fetchPsWithLabelSelector(sel, spawn));
+    const tasks = labelSelectors.map(sel => () => fetchPsWithLabelSelector(sel, spawn));
     if (namePrefixes.length > 0) {
-        tasks.push(
+        tasks.push(() =>
             fetchAllPsContainers(spawn).then(all =>
                 all.filter(c => nameMatches(c.name, namePrefixes))
             )
         );
     }
 
-    const lists = await Promise.all(tasks);
+    const lists = await mapWithConcurrency(tasks, concurrency, task => task());
     let candidates = [];
     for (const list of lists)
         candidates = mergeContainersById(candidates, list);
@@ -496,16 +705,21 @@ function defaultStatsWarning(msg) {
 
 /**
  * Load container list + restart counts + one-shot stats for filtered apps only.
- * `options` may be a `spawn(args)` function or `{ spawn, formatInspectWarning, formatStatsWarning }`.
+ * `options` may be a `spawn(args)` function or
+ * `{ spawn, concurrency, timeoutMs, formatInspectWarning, formatStatsWarning }`.
  */
 export async function loadContainers(filter, options = {}) {
     const opts = typeof options === "function" ? { spawn: options } : (options || {});
-    const spawn = opts.spawn;
+    const rawSpawn = opts.spawn;
+    const concurrency = opts.concurrency || MAX_CONCURRENT_SPAWNS;
+    const timeoutMs = opts.timeoutMs === undefined ? DEFAULT_SPAWN_TIMEOUT_MS : opts.timeoutMs;
     const formatInspectWarning = opts.formatInspectWarning || defaultInspectWarning;
     const formatStatsWarning = opts.formatStatsWarning || defaultStatsWarning;
 
-    if (typeof spawn !== "function")
+    if (typeof rawSpawn !== "function")
         throw new Error("loadContainers requires a spawn function");
+
+    const spawn = withSpawnTimeout(rawSpawn, timeoutMs);
 
     const normalizedFilter = {
         namePrefixes: activeNamePrefixes(filter),
@@ -513,7 +727,7 @@ export async function loadContainers(filter, options = {}) {
     };
 
     let warning = null;
-    const candidates = await gatherCandidates(normalizedFilter, spawn);
+    const candidates = await gatherCandidates(normalizedFilter, spawn, { concurrency });
 
     if (candidates.length === 0)
         return { containers: [], warning: null };
@@ -522,13 +736,12 @@ export async function loadContainers(filter, options = {}) {
     const inspectIds = candidates.map(c => c.id).filter(Boolean);
     if (inspectIds.length > 0) {
         try {
-            const inspected = await dockerInspectAll(inspectIds, spawn);
-            applyInspectMetadata(candidates, inspected);
-            if (inspected.vanishedIds)
-                vanishedIds = inspected.vanishedIds;
-            if (inspected.errors?.length > 0) {
-                const err = inspected.errors[0];
-                warning = formatInspectWarning(err?.message || String(err));
+            const inspectResult = await dockerInspectAll(inspectIds, spawn, { concurrency });
+            applyInspectMetadata(candidates, inspectResult.rows);
+            if (inspectResult.vanishedIds)
+                vanishedIds = inspectResult.vanishedIds;
+            if (inspectResult.errors?.length > 0) {
+                warning = formatInspectWarning(summarizeErrors(inspectResult.errors));
             }
         } catch (e) {
             warning = formatInspectWarning(e?.message || String(e));
@@ -544,8 +757,8 @@ export async function loadContainers(filter, options = {}) {
     const runningIds = filtered.filter(isContainerRunning).map(c => c.id).filter(Boolean);
     if (runningIds.length > 0) {
         try {
-            const statsRows = await dockerStatsForIds(runningIds, spawn);
-            const byId = statsByContainerId(statsRows);
+            const statsResult = await dockerStatsForIds(runningIds, spawn, { concurrency });
+            const byId = statsByContainerId(statsResult.rows);
             for (const c of filtered) {
                 const st = lookupStats(byId, c);
                 if (st) {
@@ -553,9 +766,8 @@ export async function loadContainers(filter, options = {}) {
                     c.memory = st.memory;
                 }
             }
-            if (statsRows.errors?.length > 0) {
-                const err = statsRows.errors[0];
-                const statsWarning = formatStatsWarning(err?.message || String(err));
+            if (statsResult.errors?.length > 0) {
+                const statsWarning = formatStatsWarning(summarizeErrors(statsResult.errors));
                 warning = warning ? `${warning} ${statsWarning}` : statsWarning;
             }
         } catch (e) {
@@ -573,27 +785,68 @@ export function formatWarningTimestamp(now = new Date()) {
     if (typeof now === "string")
         return now;
     const d = now instanceof Date ? now : new Date(now);
+    const yyyy = String(d.getFullYear()).padStart(4, "0");
+    const mo = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
     const hh = String(d.getHours()).padStart(2, "0");
     const mm = String(d.getMinutes()).padStart(2, "0");
     const ss = String(d.getSeconds()).padStart(2, "0");
-    return `${hh}:${mm}:${ss}`;
+    return `${yyyy}-${mo}-${dd} ${hh}:${mm}:${ss}`;
 }
 
-export function formatWarningWithMeta(message, timestamp, consecutiveFailures) {
-    return `[${timestamp}, consecutive failures: ${consecutiveFailures}] ${message}`;
+export function formatWarningWithMeta(message, timestamp, consecutiveFailures = 0) {
+    if (consecutiveFailures > 0)
+        return `[${timestamp}, consecutive failures: ${consecutiveFailures}] ${message}`;
+    return `[${timestamp}] ${message}`;
+}
+
+function runWithTimeout(fn, timeoutMs) {
+    if (!timeoutMs || timeoutMs <= 0)
+        return Promise.resolve().then(fn);
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+            if (settled)
+                return;
+            settled = true;
+            reject(new Error(`Refresh timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+
+        Promise.resolve()
+                .then(fn)
+                .then(
+                    val => {
+                        if (settled)
+                            return;
+                        settled = true;
+                        clearTimeout(timer);
+                        resolve(val);
+                    },
+                    err => {
+                        if (settled)
+                            return;
+                        settled = true;
+                        clearTimeout(timer);
+                        reject(err);
+                    }
+                );
+    });
 }
 
 /**
  * Coordinate manual and background refreshes so that:
- * - In-flight refreshes are tracked with an integer counter (`inFlightCount`).
- * - Both manual and background calls obey "at most one refresh round in flight at a time".
- * - Warnings include a timestamp and consecutive failure count, resetting on clean success.
+ * - Background refreshes are skipped while any refresh is in flight (`inFlightCount > 0`),
+ *   and do not flip `loading` to `true` (avoiding UI button flicker every 8s).
+ * - Manual refreshes (`background: false`) always preempt any in-flight refresh via `generation`.
+ * - Each refresh round is bounded by `timeoutMs` so a hung daemon never blocks future refreshes forever.
+ * - `consecutiveFailures` only counts failed refresh rounds (thrown errors), not partial warnings.
  */
 export function createRefreshController({
     load,
     onStateChange,
     now = () => new Date(),
     formatWarningMeta = formatWarningWithMeta,
+    timeoutMs = DEFAULT_REFRESH_TIMEOUT_MS,
 }) {
     let inFlightCount = 0;
     let generation = 0;
@@ -618,7 +871,8 @@ export function createRefreshController({
 
     async function refresh(options = {}) {
         const background = options.background === true;
-        if (inFlightCount > 0)
+
+        if (background && inFlightCount > 0)
             return false;
 
         inFlightCount += 1;
@@ -627,24 +881,23 @@ export function createRefreshController({
         if (!background) {
             emit({ loading: true, error: null, warning: null });
         } else {
-            emit({});
+            state = { ...state, inFlightCount };
         }
 
         let completionPatch = {};
         try {
-            const result = await load();
+            const result = await runWithTimeout(load, timeoutMs);
             if (gen === generation) {
+                consecutiveFailures = 0;
                 if (result.warning) {
-                    consecutiveFailures += 1;
                     lastWarningAt = formatWarningTimestamp(now());
-                    const formatted = formatWarningMeta(result.warning, lastWarningAt, consecutiveFailures);
+                    const formatted = formatWarningMeta(result.warning, lastWarningAt, 0);
                     completionPatch = {
                         containers: result.containers,
                         error: null,
                         warning: formatted,
                     };
                 } else {
-                    consecutiveFailures = 0;
                     lastWarningAt = null;
                     completionPatch = {
                         containers: result.containers,
@@ -672,13 +925,14 @@ export function createRefreshController({
             }
         } finally {
             inFlightCount = Math.max(0, inFlightCount - 1);
-            const nextLoading = (!background && gen === generation)
-                ? false
-                : (inFlightCount === 0 ? false : state.loading);
-            emit({
-                ...completionPatch,
-                loading: nextLoading,
-            });
+            if (gen === generation) {
+                emit({
+                    ...completionPatch,
+                    loading: false,
+                });
+            } else {
+                emit({});
+            }
         }
         return true;
     }

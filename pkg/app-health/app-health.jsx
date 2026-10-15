@@ -25,12 +25,11 @@ import { SyncAltIcon } from '@patternfly/react-icons';
 import cockpit from "cockpit";
 
 import {
-    activeLabelSelectors,
-    activeNamePrefixes,
     createRefreshController,
     DEFAULT_LABEL_SELECTORS,
     LIST_REFRESH_MS,
     loadContainers,
+    resolveFilterConfig,
 } from './app-health-lib.js';
 
 import './app-health.scss';
@@ -47,13 +46,17 @@ function dockerSpawn(args, options = {}) {
 
 function readFilterConfig() {
     const config = cockpit.manifests?.["app-health"]?.config || {};
-    const namePrefixes = config["name-prefixes"] ?? config.namePrefixes ?? [];
-    const labelSelectors = config["label-selectors"] ?? config.labelSelectors ?? DEFAULT_LABEL_SELECTORS;
-
-    return {
-        namePrefixes: activeNamePrefixes({ namePrefixes }),
-        labelSelectors: activeLabelSelectors({ labelSelectors }),
-    };
+    return resolveFilterConfig(config, DEFAULT_LABEL_SELECTORS, {
+        invalidNamePrefixesType: () => _("name-prefixes must be an array of non-empty strings"),
+        invalidNamePrefixEntry: entry => cockpit.format(_("ignored invalid name-prefixes entry: $0"), entry),
+        invalidLabelSelectorsType: fallback => cockpit.format(
+            _("label-selectors must be an array; falling back to default ($0)"),
+            fallback
+        ),
+        invalidLabelSelectorEntry: entry => cockpit.format(_("ignored invalid label-selectors entry: $0"), entry),
+        noActiveFilterRules: () =>
+            _("no effective filter rules are active (both name-prefixes and label-selectors are empty); no containers will match"),
+    });
 }
 
 function statusVariant(status, state) {
@@ -122,12 +125,14 @@ const ContainerList = () => {
                 msg
             ),
         }),
-        formatWarningMeta: (msg, time, count) => cockpit.format(
-            _("[$0, consecutive failures: $1] $2"),
-            time,
-            count,
-            msg
-        ),
+        formatWarningMeta: (msg, time, count) => count > 0
+            ? cockpit.format(
+                _("[$0, consecutive failures: $1] $2"),
+                time,
+                count,
+                msg
+            )
+            : cockpit.format(_("[$0] $1"), time, msg),
         onStateChange: setRefreshState,
     }), [filter]);
 
@@ -140,8 +145,7 @@ const ContainerList = () => {
         return () => window.clearInterval(timer);
     }, [refresh]);
 
-    const { containers, error, warning, loading, inFlightCount } = refreshState;
-    const isBusy = loading || inFlightCount > 0;
+    const { containers, error, warning, loading } = refreshState;
 
     const columns = [
         { title: _("Name") },
@@ -179,23 +183,39 @@ const ContainerList = () => {
         props: { key: c.id || c.name },
     }));
 
+    const configAlert = filter.configWarning && (
+        <Alert variant="warning" isInline className="app-health-warning"
+               title={_("Invalid filter configuration in manifest")}>
+            <p>{filter.configWarning}</p>
+        </Alert>
+    );
+
     let body;
     if (loading && containers === null) {
-        body = <EmptyStatePanel loading title={_("Loading containers...")} />;
+        body = (
+            <>
+                {configAlert}
+                <EmptyStatePanel loading title={_("Loading containers...")} />
+            </>
+        );
     } else if (error) {
         body = (
-            <Alert variant="danger" isInline
-                   title={_("Failed to list Docker containers")}>
-                <p>{error}</p>
-                <p className="app-health-hint">
-                    {_("Ensure the Docker CLI is installed and the logged-in user can run docker (e.g. membership in the docker group).")}
-                </p>
-                <Button variant="secondary" isDisabled={isBusy} onClick={() => refresh()}>{_("Retry")}</Button>
-            </Alert>
+            <>
+                {configAlert}
+                <Alert variant="danger" isInline
+                       title={_("Failed to list Docker containers")}>
+                    <p>{error}</p>
+                    <p className="app-health-hint">
+                        {_("Ensure the Docker CLI is installed and the logged-in user can run docker (e.g. membership in the docker group).")}
+                    </p>
+                    <Button variant="secondary" isDisabled={loading} onClick={() => refresh()}>{_("Retry")}</Button>
+                </Alert>
+            </>
         );
     } else {
         body = (
             <>
+                {configAlert}
                 {warning && (
                     <Alert variant="warning" isInline className="app-health-warning"
                            title={_("Some container data could not be refreshed")}>
@@ -217,8 +237,8 @@ const ContainerList = () => {
                 <CardHeader actions={{
                     actions: (
                         <Button variant="secondary"
-                                icon={isBusy ? <Spinner size="md" /> : <SyncAltIcon />}
-                                isDisabled={isBusy}
+                                icon={loading ? <Spinner size="md" /> : <SyncAltIcon />}
+                                isDisabled={loading}
                                 onClick={() => refresh()}>
                             {_("Refresh")}
                         </Button>

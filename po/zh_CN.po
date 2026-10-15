@@ -246,80 +246,122 @@ msgstr "存储"
 msgid "Diagnostic reports"
 msgstr "诊断报告"
 
-#: pkg/app-health/index.html:8 pkg/app-health/manifest.json:0
-#: pkg/app-health/app-health.jsx:252
+#: pkg/app-health/index.html:8 pkg/app-health/app-health.jsx:272
+#: pkg/app-health/manifest.json:0
 msgid "Application Health"
 msgstr "应用健康"
 
-#: pkg/app-health/app-health.jsx:85
+#: pkg/app-health/app-health.jsx:50
+msgid "name-prefixes must be an array of non-empty strings"
+msgstr "name-prefixes 必须是非空字符串数组"
+
+#: pkg/app-health/app-health.jsx:51
+msgid "ignored invalid name-prefixes entry: $0"
+msgstr "已忽略无效的 name-prefixes 项：$0"
+
+#: pkg/app-health/app-health.jsx:53
+msgid "label-selectors must be an array; falling back to default ($0)"
+msgstr "label-selectors 必须是数组；已回退到默认值（$0）"
+
+#: pkg/app-health/app-health.jsx:56
+msgid "ignored invalid label-selectors entry: $0"
+msgstr "已忽略无效的 label-selectors 项：$0"
+
+#: pkg/app-health/app-health.jsx:58
+msgid ""
+"no effective filter rules are active (both name-prefixes and label-selectors "
+"are empty); no containers will match"
+msgstr ""
+"当前没有生效的过滤规则（name-prefixes 和 label-selectors 均为空）；不会匹配任"
+"何容器"
+
+#: pkg/app-health/app-health.jsx:88
 msgid "Container: $0"
 msgstr "容器：$0"
 
-#: pkg/app-health/app-health.jsx:88
+#: pkg/app-health/app-health.jsx:91
 msgid "Detail view is not implemented yet"
 msgstr "详情视图尚未实现"
 
-#: pkg/app-health/app-health.jsx:90
-msgid "This is a stub. A future revision can show inspect JSON, logs, and lifecycle actions."
+#: pkg/app-health/app-health.jsx:93
+msgid ""
+"This is a stub. A future revision can show inspect JSON, logs, and lifecycle "
+"actions."
 msgstr "这是占位页面。后续版本可展示 inspect JSON、日志和生命周期操作。"
 
-#: pkg/app-health/app-health.jsx:93
+#: pkg/app-health/app-health.jsx:96
 msgid "Back to list"
 msgstr "返回列表"
 
-#: pkg/app-health/app-health.jsx:117
-msgid "Could not inspect containers (restart counts and labels may be incomplete): $0"
+#: pkg/app-health/app-health.jsx:120
+msgid ""
+"Could not inspect containers (restart counts and labels may be incomplete): "
+"$0"
 msgstr "无法 inspect 容器（重启次数与标签可能不完整）：$0"
 
-#: pkg/app-health/app-health.jsx:121
+#: pkg/app-health/app-health.jsx:124
 msgid "Could not read container stats (CPU/memory unavailable): $0"
 msgstr "无法读取容器 stats（CPU/内存不可用）：$0"
 
-#: pkg/app-health/app-health.jsx:126
+#: pkg/app-health/app-health.jsx:130
 msgid "[$0, consecutive failures: $1] $2"
 msgstr "[$0，连续失败 $1 次] $2"
 
-#: pkg/app-health/app-health.jsx:148
+#: pkg/app-health/app-health.jsx:135
+msgid "[$0] $1"
+msgstr "[$0] $1"
+
+#: pkg/app-health/app-health.jsx:152
 msgid "Image"
 msgstr "镜像"
 
-#: pkg/app-health/app-health.jsx:152
+#: pkg/app-health/app-health.jsx:156
 msgid "Restarts"
 msgstr "重启次数"
 
-#: pkg/app-health/app-health.jsx:184
+#: pkg/app-health/app-health.jsx:188
+msgid "Invalid filter configuration in manifest"
+msgstr "manifest 中的过滤器配置无效"
+
+#: pkg/app-health/app-health.jsx:198
 msgid "Loading containers..."
 msgstr "正在加载容器..."
 
-#: pkg/app-health/app-health.jsx:188
+#: pkg/app-health/app-health.jsx:206
 msgid "Failed to list Docker containers"
 msgstr "无法列出 Docker 容器"
 
-#: pkg/app-health/app-health.jsx:191
-msgid "Ensure the Docker CLI is installed and the logged-in user can run docker (e.g. membership in the docker group)."
-msgstr "请确保已安装 Docker CLI，且当前登录用户可运行 docker（例如属于 docker 组）。"
+#: pkg/app-health/app-health.jsx:209
+msgid ""
+"Ensure the Docker CLI is installed and the logged-in user can run docker "
+"(e.g. membership in the docker group)."
+msgstr ""
+"请确保已安装 Docker CLI，且当前登录用户可运行 docker（例如属于 docker 组）。"
 
-#: pkg/app-health/app-health.jsx:193
+#: pkg/app-health/app-health.jsx:211
 msgid "Retry"
 msgstr "重试"
 
-#: pkg/app-health/app-health.jsx:201
+#: pkg/app-health/app-health.jsx:221
 msgid "Some container data could not be refreshed"
 msgstr "部分容器数据未能刷新"
 
-#: pkg/app-health/app-health.jsx:205
+#: pkg/app-health/app-health.jsx:225
 msgid "Docker containers"
 msgstr "Docker 容器"
 
-#: pkg/app-health/app-health.jsx:207
-msgid "No matching containers. Adjust filters in manifest config or tag apps with the configured label."
-msgstr "没有匹配的容器。请在 manifest 配置中调整过滤器，或为应用添加所配置的标签。"
+#: pkg/app-health/app-health.jsx:227
+msgid ""
+"No matching containers. Adjust filters in manifest config or tag apps with "
+"the configured label."
+msgstr ""
+"没有匹配的容器。请在 manifest 配置中调整过滤器，或为应用添加所配置的标签。"
 
-#: pkg/app-health/app-health.jsx:229
+#: pkg/app-health/app-health.jsx:249
 msgid "Docker applications"
 msgstr "Docker 应用"
 
-#: pkg/app-health/app-health.jsx:233
+#: pkg/app-health/app-health.jsx:253
 msgid "Listed when container name or labels match manifest config"
 msgstr "当容器名称或标签与 manifest 配置匹配时显示"
 
@@ -446,7 +488,7 @@ msgstr "使用以下密钥来验证其他系统"
 #: pkg/storaged/iscsi/create-dialog.jsx:97
 #: pkg/storaged/iscsi/create-dialog.jsx:154
 #: pkg/storaged/block/format-dialog.jsx:279
-#: pkg/app-health/app-health.jsx:147
+#: pkg/app-health/app-health.jsx:151
 msgid "Name"
 msgstr "名称"
 
@@ -3076,7 +3118,7 @@ msgstr "占用率"
 #: pkg/systemd/overview-cards/usageCard.jsx:124 pkg/systemd/hwinfo.jsx:102
 #: pkg/metrics/metrics.jsx:100 pkg/metrics/metrics.jsx:770
 #: pkg/metrics/metrics.jsx:1553 pkg/metrics/metrics.jsx:1934
-#: pkg/app-health/app-health.jsx:150
+#: pkg/app-health/app-health.jsx:154
 msgid "CPU"
 msgstr "CPU"
 
@@ -3084,7 +3126,7 @@ msgstr "CPU"
 #: pkg/systemd/hwinfo.jsx:324 pkg/systemd/service-details.jsx:738
 #: pkg/metrics/metrics.jsx:114 pkg/metrics/metrics.jsx:830
 #: pkg/metrics/metrics.jsx:1553 pkg/metrics/metrics.jsx:1935
-#: pkg/app-health/app-health.jsx:151
+#: pkg/app-health/app-health.jsx:155
 msgid "Memory"
 msgstr "内存"
 
@@ -3716,7 +3758,7 @@ msgstr "固定单元"
 
 #: pkg/systemd/service-details.jsx:727 pkg/packagekit/updates.jsx:772
 #: pkg/networkmanager/network-interface.jsx:468
-#: pkg/app-health/app-health.jsx:149
+#: pkg/app-health/app-health.jsx:153
 msgid "Status"
 msgstr "状态"
 
@@ -5594,7 +5636,7 @@ msgid "Filter"
 msgstr "过滤"
 
 #: pkg/networkmanager/network-interface.jsx:1070
-#: pkg/app-health/app-health.jsx:223
+#: pkg/app-health/app-health.jsx:243
 msgid "Refresh"
 msgstr "刷新"
 
@@ -5734,7 +5776,7 @@ msgstr "编辑网桥设置"
 
 #: pkg/networkmanager/bridge.jsx:86 pkg/networkmanager/team.jsx:144
 #: pkg/networkmanager/network-interface-members.jsx:197
-#: pkg/app-health/app-health.jsx:153
+#: pkg/app-health/app-health.jsx:157
 msgid "Ports"
 msgstr "端口"
 
@@ -10393,6 +10435,26 @@ msgstr "使用 Tang 服务器"
 #: pkg/sosreport/manifest.json:0
 msgid "sos"
 msgstr "sos"
+
+#: pkg/app-health/manifest.json:0
+msgid "docker"
+msgstr "docker"
+
+#: pkg/app-health/manifest.json:0
+msgid "container"
+msgstr "容器"
+
+#: pkg/app-health/manifest.json:0
+msgid "app"
+msgstr "应用"
+
+#: pkg/app-health/manifest.json:0
+msgid "health"
+msgstr "健康"
+
+#: pkg/app-health/manifest.json:0
+msgid "monitor"
+msgstr "监控"
 
 #: src/ws/org.cockpit_project.cockpit.appdata.xml.in:7
 msgid "Cockpit"

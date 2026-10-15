@@ -51,29 +51,43 @@ Or set name prefixes for your naming convention:
 
 A container is listed when it matches **any** configured name prefix **or** any
 configured label selector. If both arrays are empty, nothing is listed until
-you configure filters.
+you configure filters. Invalid filter entries, non-array values, or an empty
+effective rule set are surfaced as an inline notice banner in the UI (and a
+non-array `label-selectors` value falls back to the default
+`cockpit.app-health=true`).
 
 ## What is implemented
 
 | Feature | Status |
 | --- | --- |
-| Menu entry **Application Health** (English msgid; translated in `.po`) | Done |
+| Menu entry **Application Health** + search keywords (English msgids in `manifest.json`; translated in `.po`) | Done |
 | List containers via `docker ps -a --format` | Done |
-| Filter by manifest `name-prefixes` / `label-selectors` | Done |
+| Filter by manifest `name-prefixes` / `label-selectors` (with UI notice on invalid/empty config) | Done |
 | Name, image, status, ports | Done |
-| Restart count via batched `docker inspect` (50 IDs per call) | Done |
-| CPU / memory via `docker stats --no-stream`, joined by container ID | Done |
-| Manual refresh + auto-refresh every 8s on the list | Done |
+| Restart count via batched `docker inspect` on **candidates only** (50 IDs/call, shared global concurrency cap of 4, vanished-ID extraction batch retry + binary divide-and-conquer fallback when a container disappears mid-refresh) | Done |
+| CPU / memory via batched `docker stats` on **filtered running** IDs (shared global concurrency cap of 4, vanished-ID extraction batch retry + binary divide-and-conquer fallback, bounded by a dedicated stage timeout so slow stats degrade to a warning without failing the round) | Done |
+| Manual refresh + auto-refresh every 8s (manual preemption over background, `AbortSignal` cancellation on per-command/per-stage/per-round timeouts, timezone-aware timestamps + failure count on both warnings and errors) | Done |
 | Container detail view | **Stub** (placeholder page) |
 | Start / stop / restart actions | **Not implemented** |
 | Live streaming stats | **Not implemented** |
 
-## Tests
+## Tests & i18n
 
-Unit tests for filter/stats helpers live in `pkg/app-health/test-app-health-lib.js`
-and run with the repo QUnit harness (`./build.js` then open `qunit/` in a
-browser, or the full Cockpit `make check` flow). There is no browser integration
-test for this package yet.
+Unit tests for filter matching, config validation, shared global concurrency,
+per-command/per-stage/per-round timeout cancellation (`AbortSignal`), fast-fail vs
+vanished-ID batch retry / divide-and-conquer fallback on vanished containers, and refresh preemption/warning metadata
+live in `pkg/app-health/test-app-health-lib.js` and run with the repo QUnit
+harness (`./build.js` then open `qunit/` in a browser, or the full Cockpit
+`make check` flow). There is no browser integration test for this package yet.
+
+Menu `label` and `keywords` in `manifest.json` use English msgids (`docker`,
+`container`, `app`, `health`, `monitor`) with `zh_CN` translations in
+`po/zh_CN.po` (so Chinese keyword search works in the `zh_CN` locale while
+English locales search by English keywords). Translations in `po/*.po` are
+filtered per package by `pkg/lib/cockpit-po-plugin.js` using
+`#: pkg/app-health/…` source references. In a full autotools checkout, refresh
+template references via `make po/cockpit.pot` (`xgettext`, `html2po`, and
+`manifest2po` in `po/Makefile.am`) and merge into `po/*.po` with `msgmerge`.
 
 ## Build (in this monorepo)
 
@@ -110,9 +124,9 @@ other `pkg/*` modules.
 
 The UI runs these via `cockpit.spawn` (no custom bridge):
 
-1. `docker ps -a --format '{{json .}}'` — inventory (name, status, image, ports, id)
-2. `docker inspect --format '{{json .}}' …` — restart counts and labels (batched)
-3. `docker stats --no-stream --format '{{json .}}'` — one-shot CPU / memory for running containers
+1. `docker ps -a` (optionally with `--filter label=…`) — candidate inventory only
+2. `docker inspect --format '{{json .}}' …` — restart counts / labels for candidates (batched)
+3. `docker stats --no-stream --format '{{json .}}' <ids…>` — CPU / memory for filtered running containers (batched)
 
 If any command fails (Docker missing, permission denied, daemon down), the page
 shows an error alert with the stderr message.

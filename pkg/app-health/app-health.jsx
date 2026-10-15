@@ -25,16 +25,11 @@ import { SyncAltIcon } from '@patternfly/react-icons';
 import cockpit from "cockpit";
 
 import {
-    chunkArray,
-    containerMatchesFilter,
+    createRefreshController,
     DEFAULT_LABEL_SELECTORS,
-    INSPECT_BATCH_SIZE,
     LIST_REFRESH_MS,
-    lookupStats,
-    normalizeContainerId,
-    normalizeName,
-    parseJsonLines,
-    statsByContainerId,
+    loadContainers,
+    resolveFilterConfig,
 } from './app-health-lib.js';
 
 import './app-health.scss';
@@ -51,15 +46,17 @@ function dockerSpawn(args, options = {}) {
 
 function readFilterConfig() {
     const config = cockpit.manifests?.["app-health"]?.config || {};
-    const namePrefixes = config["name-prefixes"] ?? config.namePrefixes ?? [];
-    const labelSelectors = config["label-selectors"] ?? config.labelSelectors;
-
-    return {
-        namePrefixes: Array.isArray(namePrefixes) ? namePrefixes : [],
-        labelSelectors: Array.isArray(labelSelectors)
-            ? labelSelectors
-            : DEFAULT_LABEL_SELECTORS,
-    };
+    return resolveFilterConfig(config, DEFAULT_LABEL_SELECTORS, {
+        invalidNamePrefixesType: () => _("name-prefixes must be an array of non-empty strings"),
+        invalidNamePrefixEntry: entry => cockpit.format(_("ignored invalid name-prefixes entry: $0"), entry),
+        invalidLabelSelectorsType: fallback => cockpit.format(
+            _("label-selectors must be an array; falling back to default ($0)"),
+            fallback
+        ),
+        invalidLabelSelectorEntry: entry => cockpit.format(_("ignored invalid label-selectors entry: $0"), entry),
+        noActiveFilterRules: () =>
+            _("no effective filter rules are active (both name-prefixes and label-selectors are empty); no containers will match"),
+    });
 }
 
 function statusVariant(status, state) {
@@ -84,107 +81,6 @@ function labelColor(status, state) {
     return "grey";
 }
 
-async function dockerInspectAll(ids) {
-    const inspected = [];
-    for (const batch of chunkArray(ids, INSPECT_BATCH_SIZE)) {
-        const inspectOut = await dockerSpawn([
-            "inspect",
-            "--format", "{{json .}}",
-            ...batch,
-        ]);
-        inspected.push(...parseJsonLines(inspectOut));
-    }
-    return inspected;
-}
-
-/**
- * Load container list + restart counts + one-shot stats.
- * Detail view is intentionally stubbed (see ContainerDetailStub).
- */
-async function loadContainers(filter) {
-    const psOut = await dockerSpawn([
-        "ps", "-a",
-        "--format", "{{json .}}",
-    ]);
-    const listed = parseJsonLines(psOut);
-
-    const containers = listed.map(row => {
-        const id = row.ID || row.Id || "";
-        const name = normalizeName(
-            (row.Names || row.Name || "").split(",")[0] || id.slice(0, 12)
-        );
-        return {
-            id,
-            name,
-            image: row.Image || "",
-            status: row.Status || "",
-            state: row.State || "",
-            ports: row.Ports || "",
-            created: row.CreatedAt || row.RunningFor || "",
-            labels: {},
-            restartCount: null,
-            cpu: null,
-            memory: null,
-        };
-    });
-
-    if (containers.length === 0)
-        return containers;
-
-    try {
-        const ids = containers.map(c => c.id).filter(Boolean);
-        if (ids.length > 0) {
-            const inspected = await dockerInspectAll(ids);
-            const byId = {};
-            for (const info of inspected) {
-                const fullId = info.Id || "";
-                const id = normalizeContainerId(fullId);
-                const name = normalizeName(info.Name || "");
-                const restartCount = info.RestartCount ?? info.State?.RestartCount ?? 0;
-                const labels = info.Config?.Labels || {};
-                const meta = { name, restartCount, fullId, state: info.State?.Status, labels };
-                byId[id] = meta;
-                if (fullId)
-                    byId[fullId] = meta;
-            }
-            for (const c of containers) {
-                const meta = byId[c.id] || byId[normalizeContainerId(c.id)];
-                if (meta) {
-                    c.restartCount = meta.restartCount;
-                    c.labels = meta.labels;
-                    if (meta.state)
-                        c.state = meta.state;
-                    if (meta.name)
-                        c.name = meta.name;
-                }
-            }
-        }
-    } catch (e) {
-        console.warn("app-health: docker inspect failed (restart counts skipped)", e);
-    }
-
-    const filtered = containers.filter(c => containerMatchesFilter(c, filter));
-
-    try {
-        const statsOut = await dockerSpawn([
-            "stats", "--no-stream", "--format", "{{json .}}",
-        ]);
-        const byId = statsByContainerId(parseJsonLines(statsOut));
-        for (const c of filtered) {
-            const st = lookupStats(byId, c);
-            if (st) {
-                c.cpu = st.cpu;
-                c.memory = st.memory;
-            }
-        }
-    } catch (e) {
-        console.warn("app-health: docker stats failed (CPU/memory skipped)", e);
-    }
-
-    filtered.sort((a, b) => a.name.localeCompare(b.name));
-    return filtered;
-}
-
 const ContainerDetailStub = ({ name }) => (
     <PageSection hasBodyWrapper={false} padding={{ default: "padding" }}>
         <Card>
@@ -206,30 +102,50 @@ const ContainerDetailStub = ({ name }) => (
 );
 
 const ContainerList = () => {
-    const [containers, setContainers] = useState(null);
-    const [error, setError] = useState(null);
-    const [loading, setLoading] = useState(true);
     const filter = useMemo(() => readFilterConfig(), []);
+    const [refreshState, setRefreshState] = useState({
+        containers: null,
+        error: null,
+        warning: null,
+        loading: true,
+        consecutiveFailures: 0,
+        lastWarningAt: null,
+    });
 
-    const refresh = useCallback(async (options = {}) => {
-        const background = options.background === true;
-        if (!background) {
-            setLoading(true);
-            setError(null);
-        }
-        try {
-            const list = await loadContainers(filter);
-            setContainers(list);
-            if (!background)
-                setError(null);
-        } catch (e) {
-            setContainers([]);
-            setError(e.message || String(e));
-        } finally {
-            if (!background)
-                setLoading(false);
-        }
-    }, [filter]);
+    const controller = useMemo(() => createRefreshController({
+        load: ({ signal } = {}) => loadContainers(filter, {
+            spawn: dockerSpawn,
+            signal,
+            formatSpawnTimeout: (subcmd, timeoutMs) => cockpit.format(
+                _("$0 timed out after $1ms"),
+                subcmd,
+                timeoutMs
+            ),
+            formatInspectWarning: msg => cockpit.format(
+                _("Could not inspect containers (restart counts and labels may be incomplete): $0"),
+                msg
+            ),
+            formatStatsWarning: msg => cockpit.format(
+                _("Could not read container stats (CPU/memory unavailable): $0"),
+                msg
+            ),
+        }),
+        formatTimeoutError: timeoutMs => cockpit.format(
+            _("Refresh timed out after $0ms"),
+            timeoutMs
+        ),
+        formatWarningMeta: (msg, time, count) => count > 0
+            ? cockpit.format(
+                _("[$0, consecutive failures: $1] $2"),
+                time,
+                count,
+                msg
+            )
+            : cockpit.format(_("[$0] $1"), time, msg),
+        onStateChange: setRefreshState,
+    }), [filter]);
+
+    const refresh = useCallback((options = {}) => controller.refresh(options), [controller]);
 
     useInit(() => { refresh() });
 
@@ -237,6 +153,8 @@ const ContainerList = () => {
         const timer = window.setInterval(() => refresh({ background: true }), LIST_REFRESH_MS);
         return () => window.clearInterval(timer);
     }, [refresh]);
+
+    const { containers, error, warning, loading } = refreshState;
 
     const columns = [
         { title: _("Name") },
@@ -274,27 +192,51 @@ const ContainerList = () => {
         props: { key: c.id || c.name },
     }));
 
+    const configAlert = filter.configWarning && (
+        <Alert variant="warning" isInline className="app-health-warning"
+               title={_("Container filter configuration notice")}>
+            <p>{filter.configWarning}</p>
+        </Alert>
+    );
+
     let body;
     if (loading && containers === null) {
-        body = <EmptyStatePanel loading title={_("Loading containers...")} />;
+        body = (
+            <>
+                {configAlert}
+                <EmptyStatePanel loading title={_("Loading containers...")} />
+            </>
+        );
     } else if (error) {
         body = (
-            <Alert variant="danger" isInline
-                   title={_("Failed to list Docker containers")}>
-                <p>{error}</p>
-                <p className="app-health-hint">
-                    {_("Ensure the Docker CLI is installed and the logged-in user can run docker (e.g. membership in the docker group).")}
-                </p>
-                <Button variant="secondary" onClick={() => refresh()}>{_("Retry")}</Button>
-            </Alert>
+            <>
+                {configAlert}
+                <Alert variant="danger" isInline
+                       title={_("Failed to list Docker containers")}>
+                    <p>{error}</p>
+                    <p className="app-health-hint">
+                        {_("Ensure the Docker CLI is installed and the logged-in user can run docker (e.g. membership in the docker group).")}
+                    </p>
+                    <Button variant="secondary" isDisabled={loading} onClick={() => refresh()}>{_("Retry")}</Button>
+                </Alert>
+            </>
         );
     } else {
         body = (
-            <ListingTable aria-label={_("Docker containers")}
-                          variant="compact"
-                          emptyCaption={_("No matching containers. Adjust filters in manifest config or tag apps with the configured label.")}
-                          columns={columns}
-                          rows={rows} />
+            <>
+                {configAlert}
+                {warning && (
+                    <Alert variant="warning" isInline className="app-health-warning"
+                           title={_("Some container data could not be refreshed")}>
+                        <p>{warning}</p>
+                    </Alert>
+                )}
+                <ListingTable aria-label={_("Docker containers")}
+                              variant="compact"
+                              emptyCaption={_("No matching containers. Adjust filters in manifest config or tag apps with the configured label.")}
+                              columns={columns}
+                              rows={rows} />
+            </>
         );
     }
 
